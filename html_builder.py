@@ -200,9 +200,9 @@ body{{
 }}
 .s-item.active .s-avatar{{background:linear-gradient(135deg,var(--accent),#00e396);}}
 .s-info{{min-width:0;}}
-.s-name{{font-size:.76rem;color:#e2e8f0;font-weight:600;
+.s-name{{font-size:.82rem;color:#e2e8f0;font-weight:600;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
-.s-ret{{font-size:.7rem;font-family:var(--font-d);font-weight:700;}}
+.s-ret{{font-size:.76rem;font-family:var(--font-d);font-weight:700;}}
 .s-pos{{color:var(--pos);}} .s-neg{{color:var(--neg);}} .s-neu{{color:var(--muted);}}
 .s-empty{{font-size:.72rem;color:var(--muted);padding:6px 9px;}}
 
@@ -226,7 +226,7 @@ body{{
 .banner::before{{content:"";position:absolute;inset:0;
   background:linear-gradient(90deg,rgba(0,212,255,.04),transparent 60%);pointer-events:none;}}
 .banner-item{{display:flex;flex-direction:column;gap:4px;}}
-.banner-label{{font-size:.68rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.1em;}}
+.banner-label{{font-size:.75rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;}}
 .banner-value{{font-family:var(--font-d);font-size:1.6rem;font-weight:800;
   letter-spacing:-.03em;line-height:1;}}
 .banner-value.pos{{color:var(--pos);}} .banner-value.neg{{color:var(--neg);}}
@@ -245,8 +245,8 @@ body{{
 }}
 .card:hover{{border-color:rgba(0,212,255,.3);}}
 .card-title{{
-  font-size:.68rem;color:#94a3b8;text-transform:uppercase;
-  letter-spacing:.14em;margin-bottom:14px;display:flex;align-items:center;gap:7px;
+  font-size:.78rem;color:#94a3b8;text-transform:uppercase;
+  letter-spacing:.10em;margin-bottom:14px;display:flex;align-items:center;gap:7px;
 }}
 .card-title::before{{content:"";display:inline-block;width:3px;height:10px;
   background:var(--accent);border-radius:2px;}}
@@ -258,7 +258,7 @@ body{{
 }}
 table{{width:100%;border-collapse:collapse;font-size:.88rem;}}
 thead th{{
-  font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:#cbd5e1;
+  font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:#cbd5e1;
   padding:10px 11px;border-bottom:1px solid var(--border);text-align:left;font-weight:600;
 }}
 tbody tr{{border-bottom:1px solid rgba(30,45,74,.5);transition:background .12s;}}
@@ -363,6 +363,7 @@ tbody td{{padding:12px 11px;color:#f1f5f9;}}
 
 <script>
 Chart.defaults.color = "#cbd5e1";
+Chart.defaults.font.size = 12;
 Chart.defaults.font.family = "'DM Mono',monospace";
 const P = ["#00d4ff","#7b5ea7","#00e396","#ff4560","#feb019","#775dd0","#3f51b5","#03a9f4","#4caf50","#f9ce1d"];
 
