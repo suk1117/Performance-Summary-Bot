@@ -112,18 +112,23 @@ def build_user_html(
         cur_str = f"{cur_price:,.0f}" if pd.notna(cur_price) else "—"
         avg_str = f"{avg:,.0f}" if currency == "KRW" else f"{avg:,.2f}"
 
-        # 매수/평가금액 (원화 환산)
+        # 매수/평가금액 (수량 기반)
         multiplier = usd_krw if currency == "USD" else 1.0
-        buy_krw  = avg * multiplier * (weight / 100)
-        total_buy += buy_krw
-        if pd.notna(cur_price):
-            eval_krw = float(cur_price) * multiplier * (weight / 100)
-            total_eval += eval_krw
-            eval_str = f"₩{eval_krw:,.0f}" if currency == "KRW" else f"${float(cur_price)*weight/100:,.2f}"
-        else:
-            eval_str = "—"
+        qty = float(r["수량"]) if "수량" in r.index and pd.notna(r["수량"]) else None
 
-        buy_str = f"₩{buy_krw:,.0f}" if currency == "KRW" else f"${avg*weight/100:,.2f}"
+        if qty is not None:
+            buy_krw = avg * qty * multiplier
+            total_buy += buy_krw
+            buy_str = f"₩{buy_krw:,.0f}" if currency == "KRW" else f"${avg*qty:,.2f}"
+            if pd.notna(cur_price):
+                eval_krw = float(cur_price) * qty * multiplier
+                total_eval += eval_krw
+                eval_str = f"₩{eval_krw:,.0f}" if currency == "KRW" else f"${float(cur_price)*qty:,.2f}"
+            else:
+                eval_str = "—"
+        else:
+            buy_str  = "—"
+            eval_str = "—"
 
         table_rows += (
             f"<tr>"
