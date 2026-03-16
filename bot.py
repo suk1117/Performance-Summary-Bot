@@ -20,9 +20,14 @@ bot.py  ─  포트폴리오 대시보드 텔레그램 봇 (멀티유저)
 
 import io
 import os
+import sys
 import asyncio
 import threading
 import logging
+
+# Windows cp949 환경에서 이모지 print 오류 방지
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from datetime import datetime
 
 from dotenv import load_dotenv
