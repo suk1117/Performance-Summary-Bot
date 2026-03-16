@@ -1,0 +1,10 @@
+flask==3.0.3
+python-dotenv==1.0.1
+pandas==2.2.2
+openpyxl==3.1.2
+yfinance==0.2.40
+pykrx==1.0.47
+pyngrok==7.2.0
+python-telegram-bot==20.7
+apscheduler==3.10.4
+pytz==2024.1
