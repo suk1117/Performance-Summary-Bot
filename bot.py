@@ -151,7 +151,6 @@ def _summary_text(uid: int) -> str:
         lines.append(f"{r['종목명']:<10} {r['비중(%)']:>4.1f}% {ret_str:>8}")
     lines.append("```")
     lines.append(f"\n🔗 [내 대시보드]({url})")
-    lines.append(f"🔗 [전체 목록]({public_url})")
     return "\n".join(lines)
 
 
@@ -237,7 +236,7 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ts  = users[uid]["last_update"].strftime("%m/%d %H:%M")
     url = f"{public_url}/user/{uid}"
     await update.message.reply_text(
-        f"📊 *내 대시보드*\n\n🕐 기준: `{ts} KST`\n🔗 {url}\n\n전체 목록: {public_url}",
+        f"📊 *내 대시보드*\n\n🕐 기준: `{ts} KST`\n🔗 {url}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
