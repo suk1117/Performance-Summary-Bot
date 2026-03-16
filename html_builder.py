@@ -80,6 +80,7 @@ def build_user_html(
     )
     rl = json.dumps(ret_df["종목명"].tolist(), ensure_ascii=False)
     rd = json.dumps(ret_df["수익률(%)"].tolist())
+    # 수익률 차트 색상: 종목별 비중 도넛과 동일한 팔레트
     PALETTE = ["#00d4ff","#7b5ea7","#00e396","#ff4560","#feb019","#775dd0","#3f51b5","#03a9f4","#4caf50","#f9ce1d"]
     name_to_idx = {name: i for i, name in enumerate(df["종목명"].tolist())}
     rc = json.dumps([PALETTE[name_to_idx.get(n, 0) % len(PALETTE)] for n in ret_df["종목명"].tolist()])
@@ -90,12 +91,12 @@ def build_user_html(
     total_buy = total_eval = 0.0
     table_rows = ""
     for _, r in df.iterrows():
-        ret_val   = r["수익률(%)"]
+        ret_val  = r["수익률(%)"]
         cur_price = r.get("현재가")
-        avg       = float(r["평단가"])
-        weight    = float(r["비중(%)"])
-        currency  = str(r["통화"]).upper()
-        flag      = {"KR": "🇰🇷", "US": "🇺🇸", "현금": "💵"}.get(r["국가"], "🌐")
+        avg      = float(r["평단가"])
+        weight   = float(r["비중(%)"])
+        currency = str(r["통화"]).upper()
+        flag     = {"KR": "🇰🇷", "US": "🇺🇸", "현금": "💵"}.get(r["국가"], "🌐")
 
         # 수익률 셀
         if pd.isna(ret_val):
@@ -159,7 +160,7 @@ def build_user_html(
 <style>
 :root{{
   --bg:#080c14;--surface:#0d1526;--surface2:#121d35;--border:#1e2d4a;
-  --accent:#00d4ff;--pos:#00e396;--neg:#ff4560;--text:#e2e8f0;--muted:#64748b;
+  --accent:#38bdf8;--pos:#4ade80;--neg:#f87171;--text:#f1f5f9;--muted:#94a3b8;
   --sw:180px;
   --font-d:'Syne',sans-serif;--font-m:'DM Mono',monospace;
 }}
@@ -199,7 +200,7 @@ body{{
 }}
 .s-item.active .s-avatar{{background:linear-gradient(135deg,var(--accent),#00e396);}}
 .s-info{{min-width:0;}}
-.s-name{{font-size:.76rem;color:var(--text);font-weight:500;
+.s-name{{font-size:.76rem;color:#e2e8f0;font-weight:600;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .s-ret{{font-size:.7rem;font-family:var(--font-d);font-weight:700;}}
 .s-pos{{color:var(--pos);}} .s-neg{{color:var(--neg);}} .s-neu{{color:var(--muted);}}
@@ -212,7 +213,7 @@ body{{
   margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border);
 }}
 .header h1{{font-family:var(--font-d);font-size:1.5rem;font-weight:800;
-  letter-spacing:-.02em;color:#fff;}}
+  letter-spacing:-.02em;color:#f8fafc;}}
 .header h1 span{{color:var(--accent);}}
 .header .meta{{font-size:.7rem;color:var(--muted);text-align:right;line-height:1.9;}}
 
@@ -225,11 +226,11 @@ body{{
 .banner::before{{content:"";position:absolute;inset:0;
   background:linear-gradient(90deg,rgba(0,212,255,.04),transparent 60%);pointer-events:none;}}
 .banner-item{{display:flex;flex-direction:column;gap:4px;}}
-.banner-label{{font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;}}
+.banner-label{{font-size:.68rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.1em;}}
 .banner-value{{font-family:var(--font-d);font-size:1.6rem;font-weight:800;
   letter-spacing:-.03em;line-height:1;}}
 .banner-value.pos{{color:var(--pos);}} .banner-value.neg{{color:var(--neg);}}
-.banner-sub{{font-family:var(--font-d);font-size:1.3rem;font-weight:700;color:#fff;}}
+.banner-sub{{font-family:var(--font-d);font-size:1.3rem;font-weight:700;color:#f1f5f9;}}
 .banner-sub.accent{{color:var(--accent);}}
 .b-div{{width:1px;height:44px;background:var(--border);flex-shrink:0;}}
 
@@ -244,7 +245,7 @@ body{{
 }}
 .card:hover{{border-color:rgba(0,212,255,.3);}}
 .card-title{{
-  font-size:.65rem;color:#94a3b8;text-transform:uppercase;
+  font-size:.68rem;color:#94a3b8;text-transform:uppercase;
   letter-spacing:.14em;margin-bottom:14px;display:flex;align-items:center;gap:7px;
 }}
 .card-title::before{{content:"";display:inline-block;width:3px;height:10px;
@@ -255,14 +256,14 @@ body{{
   background:var(--surface);border:1px solid var(--border);
   border-radius:13px;padding:18px;margin-bottom:14px;overflow-x:auto;
 }}
-table{{width:100%;border-collapse:collapse;font-size:.8rem;}}
+table{{width:100%;border-collapse:collapse;font-size:.88rem;}}
 thead th{{
-  font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
-  padding:8px 11px;border-bottom:1px solid var(--border);text-align:left;font-weight:500;
+  font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:#cbd5e1;
+  padding:10px 11px;border-bottom:1px solid var(--border);text-align:left;font-weight:600;
 }}
 tbody tr{{border-bottom:1px solid rgba(30,45,74,.5);transition:background .12s;}}
 tbody tr:hover{{background:var(--surface2);}}
-tbody td{{padding:10px 11px;}}
+tbody td{{padding:12px 11px;color:#f1f5f9;}}
 .num{{text-align:right;font-variant-numeric:tabular-nums;}}
 .pos{{color:var(--pos);}} .neg{{color:var(--neg);}} .neutral{{color:var(--muted);}}
 .flag{{font-size:1em;}}
@@ -361,7 +362,7 @@ tbody td{{padding:10px 11px;}}
 </div>
 
 <script>
-Chart.defaults.color = "#64748b";
+Chart.defaults.color = "#cbd5e1";
 Chart.defaults.font.family = "'DM Mono',monospace";
 const P = ["#00d4ff","#7b5ea7","#00e396","#ff4560","#feb019","#775dd0","#3f51b5","#03a9f4","#4caf50","#f9ce1d"];
 
