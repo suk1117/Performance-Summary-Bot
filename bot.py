@@ -94,12 +94,46 @@ def run_flask():
 # ────────────────────────────────────────
 # ngrok
 # ────────────────────────────────────────
+def _close_existing_ngrok_tunnels():
+    """로컬 ngrok API(4040/4041)에 열린 터널을 모두 DELETE 처리."""
+    import urllib.request, urllib.error, json
+    for port in (4040, 4041):
+        try:
+            with urllib.request.urlopen(f"http://localhost:{port}/api/tunnels", timeout=2) as r:
+                tunnels = json.loads(r.read())["tunnels"]
+            for t in tunnels:
+                name = t["name"]
+                req = urllib.request.Request(
+                    f"http://localhost:{port}/api/tunnels/{name}",
+                    method="DELETE",
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=2)
+                    log.info(f"기존 터널 삭제: {name}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 def start_ngrok() -> str:
+    import time
+    from pyngrok.exception import PyngrokNgrokHTTPError
     global public_url
     ngrok_conf.get_default().auth_token = NGROK_TOKEN
-    tunnel = ngrok.connect(FLASK_PORT, "http")
-    public_url = tunnel.public_url.replace("http://", "https://")
-    log.info(f"🌐 ngrok URL: {public_url}")
+    _close_existing_ngrok_tunnels()
+    for attempt in range(7):
+        try:
+            tunnel = ngrok.connect(FLASK_PORT, "http")
+            public_url = tunnel.public_url.replace("http://", "https://")
+            log.info(f"🌐 ngrok URL: {public_url}")
+            return public_url
+        except PyngrokNgrokHTTPError as e:
+            if "already online" in str(e) and attempt < 6:
+                wait = 10
+                log.info(f"이전 ngrok 터널 해제 대기 중... ({wait}초, {attempt+1}/6)")
+                time.sleep(wait)
+            else:
+                raise
     return public_url
 
 
