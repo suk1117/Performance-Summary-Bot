@@ -59,9 +59,10 @@ def _search_kr_ticker(name: str) -> str | None:
 # ────────────────────────────────────────
 # 2. 네이버 모바일 API로 현재가 조회
 # ────────────────────────────────────────
-def _naver_stock_price(code: str) -> float | None:
+def _naver_stock_price(code: str) -> tuple[float | None, float | None]:
     """
     code 예시: "005930" (KR), "AAPL:NASDAQ" (US)
+    Returns: (price, daily_change_pct)
     """
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/basic"
@@ -74,61 +75,55 @@ def _naver_stock_price(code: str) -> float | None:
             or data.get("closePrice")
             or data.get("stockEndPrice")
         )
-        if price_str:
-            return float(str(price_str).replace(",", ""))
+        price = float(str(price_str).replace(",", "")) if price_str else None
+        # fluctuationsRatio: 전일 대비 등락률 (이미 float)
+        change = data.get("fluctuationsRatio")
+        if change is not None:
+            try:
+                change = float(change)
+            except (ValueError, TypeError):
+                change = None
+        return price, change
     except Exception as e:
         print(f"  ⚠️  네이버 가격 조회 실패 ({code}): {e}")
-    return None
+    return None, None
 
 
 # ────────────────────────────────────────
 # 3. KR 주식 현재가
 # ────────────────────────────────────────
-def get_kr_price(name: str) -> float | None:
+def get_kr_price(name: str) -> tuple[float | None, float | None]:
     ticker = _search_kr_ticker(name)
     if not ticker:
-        return None
+        return None, None
     return _naver_stock_price(ticker)
 
 
 # ────────────────────────────────────────
 # 4. US 주식 현재가 (네이버 금융)
 # ────────────────────────────────────────
-def get_us_price(ticker: str) -> float | None:
-    """ticker = 'AAPL', 'TSLA' 등 심볼만 입력"""
-    # 캐시에 거래소 정보 있으면 바로 사용
-    if ticker in _us_exchange_cache:
-        code  = f"{ticker}:{_us_exchange_cache[ticker]}"
-        price = _naver_stock_price(code)
-        if price:
-            return price
-
-    # 거래소 순서대로 시도
-    for exchange in ["NASDAQ", "NYSE", "AMEX"]:
-        code  = f"{ticker}:{exchange}"
-        price = _naver_stock_price(code)
-        if price:
-            _us_exchange_cache[ticker] = exchange
-            print(f"    🔎 {ticker} → {code}")
-            return price
-
-    # 네이버 실패 시 yfinance fallback
+def get_us_price(ticker: str) -> tuple[float | None, float | None]:
+    """ticker = 'AAPL', 'TSLA' 등 심볼만 입력. Returns (price, daily_change_pct)"""
     try:
         import yfinance as yf
         t    = yf.Ticker(ticker)
         info = t.fast_info
-        price = getattr(info, "last_price", None) or getattr(info, "regularMarketPrice", None)
+        price = getattr(info, "last_price", None)
+        prev  = getattr(info, "regular_market_previous_close", None)
         if price is None:
             hist = t.history(period="2d")
             if not hist.empty:
                 price = float(hist["Close"].iloc[-1])
+                if len(hist) >= 2:
+                    prev = float(hist["Close"].iloc[-2])
+        change = round((float(price) - float(prev)) / float(prev) * 100, 2) if price and prev else None
         if price:
-            print(f"    ⚠️  {ticker}: yfinance fallback 사용")
-            return price
+            print(f"    🔎 {ticker}: ${float(price):,.2f}")
+            return float(price), change
     except Exception as e:
-        print(f"  ⚠️  yfinance fallback 실패 ({ticker}): {e}")
+        print(f"  ⚠️  {ticker} 가격 조회 실패: {e}")
 
-    return None
+    return None, None
 
 
 # ────────────────────────────────────────
@@ -166,10 +161,12 @@ def get_usd_krw() -> float:
 # 6. 전체 포트폴리오 가격 조회
 # ────────────────────────────────────────
 def fetch_prices(df: pd.DataFrame) -> pd.DataFrame:
+    # 현금 행은 build_user_html에서 자동 계산하므로 제거
+    df = df[df["국가"] != "현금"].reset_index(drop=True)
     usd_krw = get_usd_krw()
     print(f"  💱 USD/KRW: {usd_krw:,.1f}")
 
-    current_prices, returns = [], []
+    current_prices, returns, daily_changes = [], [], []
 
     for _, row in df.iterrows():
         name    = str(row["종목명"]).strip()
@@ -180,26 +177,48 @@ def fetch_prices(df: pd.DataFrame) -> pd.DataFrame:
         if country == "현금":
             current_prices.append(avg)
             returns.append(0.0)
+            daily_changes.append(None)
             continue
 
         print(f"  🔍 {name} ({country})")
 
         if country == "KR":
-            price = get_kr_price(name)
+            price, change = get_kr_price(name)
         elif country == "US":
-            price = get_us_price(name)   # 종목명이 곧 티커 (AAPL 등)
+            price, change = get_us_price(name)   # 종목명이 곧 티커 (AAPL 등)
         else:
-            price = None
+            price, change = None, None
 
         if price is None or avg == 0:
             current_prices.append(None)
             returns.append(None)
+            daily_changes.append(None)
         else:
             current_prices.append(price)
             returns.append(round((price - avg) / avg * 100, 2))
+            daily_changes.append(change)
+
+    # ── 비중(%) 자동 계산: 종목 평가금액 / 총 평가금액 ──
+    eval_amounts = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        currency = str(row["통화"]).upper()
+        qty      = float(row["수량"]) if pd.notna(row["수량"]) else 0.0
+        cp       = current_prices[i]
+        avg      = float(row["평단가"])
+        price    = cp if cp is not None else avg   # 현재가 없으면 평단가로 대체
+        mult     = usd_krw if currency == "USD" else 1.0
+        eval_amounts.append(price * qty * mult)
+
+    total_eval = sum(e for e in eval_amounts)
+    weights = [
+        round(e / total_eval * 100, 2) if total_eval > 0 else 0.0
+        for e in eval_amounts
+    ]
 
     df = df.copy()
     df["현재가"]    = current_prices
     df["수익률(%)"] = returns
+    df["등락률(%)"] = daily_changes
+    df["비중(%)"]   = weights
     df["USD_KRW"]   = usd_krw
     return df

@@ -1,15 +1,14 @@
 """
-bot.py  ─  포트폴리오 대시보드 텔레그램 봇 (멀티유저)
+bot.py  ─  포트폴리오 대시보드 텔레그램 봇 (멀티 포트폴리오)
 ────────────────────────────────────────────────────
 사용법
-  텔레그램에서 .xlsx 파일 전송
-  → 자동으로 가격 조회 + 대시보드 생성
-  → 메인 URL(/) 에서 유저 선택 → /user/<id> 개별 대시보드
+  텔레그램에서 .xlsx 파일 전송 → 현재 활성 포트폴리오에 저장
 
 명령어
-  /portfolio  본인 대시보드 URL 전송
-  /refresh    가격 재조회
-  /summary    텍스트 수익률 요약
+  /portfolio  포트폴리오 목록 + URL
+  /refresh    활성 포트폴리오 가격 재조회
+  /summary    활성 포트폴리오 텍스트 요약
+  /run        대시보드 URL
   /help       사용법
 
 자동 스케줄 (KST)
@@ -24,18 +23,17 @@ import sys
 import asyncio
 import threading
 import logging
+from datetime import datetime
 
-# Windows cp949 환경에서 이모지 print 오류 방지
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import pandas as pd
 import pytz
-from flask import Flask, abort
+from flask import Flask, abort, jsonify, redirect, request
 from pyngrok import ngrok, conf as ngrok_conf
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, Bot
@@ -46,14 +44,17 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from price_fetcher import fetch_prices
-from html_builder import build_index_html, build_user_html
+from html_builder import build_user_html
+from storage import (
+    load_portfolios, save_portfolios,
+    create_portfolio, rename_portfolio, delete_portfolio,
+    save_snapshot, load_cashflow, add_cashflow,
+)
 
 # ══════════════════════════════════════════
-# 설정
-# ══════════════════════════════════════════
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-NGROK_TOKEN      = os.getenv("NGROK_TOKEN")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "여기에_텔레그램_토큰_입력")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+NGROK_TOKEN      = os.getenv("NGROK_TOKEN",       "여기에_ngrok_토큰_입력")
 FLASK_PORT       = 5050
 KST              = pytz.timezone("Asia/Seoul")
 # ══════════════════════════════════════════
@@ -65,12 +66,23 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── 전역 상태 ──
-# users[user_id] = { "name", "last_update", "df" }
-users: dict = {}
-public_url: str = ""
+# portfolios[pname] = { "name", "last_update", "df" }
+portfolios:   dict = {}
+active_pname: str  = ""
+public_url:   str  = ""
 
-app_flask = Flask(__name__)
-REQUIRED_COLS = {"종목명", "국가", "비중(%)", "평단가", "통화"}
+app_flask    = Flask(__name__)
+REQUIRED_COLS = {"종목명", "국가", "평단가", "수량", "통화"}
+
+
+def _is_owner(update: Update) -> bool:
+    return update.effective_user.id == TELEGRAM_CHAT_ID
+
+
+@app_flask.after_request
+def skip_ngrok_warning(response):
+    response.headers["ngrok-skip-browser-warning"] = "true"
+    return response
 
 
 # ────────────────────────────────────────
@@ -78,14 +90,161 @@ REQUIRED_COLS = {"종목명", "국가", "비중(%)", "평단가", "통화"}
 # ────────────────────────────────────────
 @app_flask.route("/")
 def index():
-    return build_index_html(users)
+    if active_pname and active_pname in portfolios:
+        return redirect(f"/p/{active_pname}")
+    if portfolios:
+        return redirect(f"/p/{next(iter(portfolios))}")
+    return "<p>포트폴리오 없음</p>", 404
 
-@app_flask.route("/user/<int:uid>")
-def user_page(uid: int):
-    if uid not in users:
+
+@app_flask.route("/p/<pname>")
+def portfolio_page(pname: str):
+    global active_pname
+    if pname not in portfolios:
         abort(404)
-    u = users[uid]
-    return build_user_html(u["df"], display_name=u.get("name", ""), all_users=users, current_uid=uid)
+    active_pname = pname
+    save_portfolios(portfolios, active_pname)
+    p = portfolios[pname]
+    return build_user_html(
+        p["df"],
+        display_name=p.get("name", "포트폴리오"),
+        cashflows=load_cashflow(pname),
+        pname=pname,
+        all_portfolios=portfolios,
+    )
+
+
+# ── 포트폴리오 관리 ──
+@app_flask.route("/api/portfolios", methods=["POST"])
+def api_create_portfolio():
+    data = request.get_json()
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "이름을 입력하세요"}), 400
+    pname = create_portfolio(name)
+    portfolios[pname] = {
+        "name":        name,
+        "last_update": None,
+        "df":          pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
+    }
+    return jsonify({"ok": True, "pname": pname})
+
+
+@app_flask.route("/api/portfolios/<pname>", methods=["PATCH"])
+def api_rename_portfolio(pname: str):
+    if pname not in portfolios:
+        return jsonify({"error": "포트폴리오 없음"}), 404
+    data = request.get_json()
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "이름을 입력하세요"}), 400
+    portfolios[pname]["name"] = name
+    rename_portfolio(pname, name)
+    return jsonify({"ok": True})
+
+
+@app_flask.route("/api/portfolios/<pname>", methods=["DELETE"])
+def api_delete_portfolio(pname: str):
+    global active_pname
+    if pname not in portfolios:
+        return jsonify({"error": "포트폴리오 없음"}), 404
+    if len(portfolios) <= 1:
+        return jsonify({"error": "마지막 포트폴리오는 삭제할 수 없습니다"}), 400
+    del portfolios[pname]
+    new_active = delete_portfolio(pname)
+    if not new_active or new_active not in portfolios:
+        new_active = next(iter(portfolios))
+    active_pname = new_active
+    return jsonify({"ok": True, "redirect": f"/p/{new_active}"})
+
+
+# ── 종목 추가/수정 ──
+@app_flask.route("/api/p/<pname>/stock", methods=["POST"])
+def api_add_stock(pname: str):
+    if pname not in portfolios:
+        portfolios[pname] = {
+            "name": pname, "last_update": None,
+            "df": pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
+        }
+    data = request.get_json()
+    try:
+        name     = str(data["종목명"]).strip()
+        country  = str(data["국가"]).strip()
+        qty      = float(data["수량"])
+        avg      = float(data["평단가"])
+        currency = "USD" if country == "US" else "KRW"
+
+        df = portfolios[pname]["df"].copy()
+        if "비중(%)" not in df.columns:
+            df["비중(%)"] = 0.0
+        if name in df["종목명"].values:
+            df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
+                [country, avg, qty, currency]
+        else:
+            new_row = pd.DataFrame([{
+                "종목명": name, "국가": country,
+                "비중(%)": 0.0, "평단가": avg, "수량": qty, "통화": currency,
+            }])
+            df = pd.concat([df, new_row], ignore_index=True)
+
+        drop_cols = [c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in df.columns]
+        portfolios[pname]["df"] = df.drop(columns=drop_cols)
+        save_portfolios(portfolios, active_pname)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# ── 종목 삭제 ──
+@app_flask.route("/api/p/<pname>/stock/<path:name>", methods=["DELETE"])
+def api_del_stock(pname: str, name: str):
+    if pname not in portfolios:
+        return jsonify({"error": "포트폴리오 없음"}), 404
+    df = portfolios[pname]["df"]
+    if name not in df["종목명"].values:
+        return jsonify({"error": "종목 없음"}), 404
+    portfolios[pname]["df"] = df[df["종목명"] != name].reset_index(drop=True)
+    save_portfolios(portfolios, active_pname)
+    return jsonify({"ok": True})
+
+
+# ── 가격 재조회 ──
+@app_flask.route("/api/p/<pname>/refresh", methods=["POST"])
+def api_refresh(pname: str):
+    if pname not in portfolios:
+        return jsonify({"error": "포트폴리오 없음"}), 404
+    df = portfolios[pname].get("df")
+    if df is None or len(df) == 0:
+        return jsonify({"error": "종목을 먼저 추가해 주세요"}), 400
+    try:
+        build_dashboard_for(pname)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── 자금 기록 ──
+@app_flask.route("/api/cashflow/<pname>", methods=["GET"])
+def api_get_cashflow(pname: str):
+    return jsonify(load_cashflow(pname))
+
+
+@app_flask.route("/api/cashflow/<pname>", methods=["POST"])
+def api_add_cashflow_route(pname: str):
+    data = request.get_json()
+    try:
+        type_  = str(data["type"]).strip()
+        amount = float(data["amount"])
+        memo   = str(data.get("memo", "")).strip()
+        if type_ not in ("in", "out"):
+            return jsonify({"error": "type은 'in' 또는 'out'이어야 합니다"}), 400
+        if amount <= 0:
+            return jsonify({"error": "금액은 0보다 커야 합니다"}), 400
+        add_cashflow(pname, type_, amount, memo)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
 
 def run_flask():
     app_flask.run(port=FLASK_PORT, use_reloader=False)
@@ -94,44 +253,43 @@ def run_flask():
 # ────────────────────────────────────────
 # ngrok
 # ────────────────────────────────────────
-def _close_existing_ngrok_tunnels():
-    """로컬 ngrok API(4040/4041)에 열린 터널을 모두 DELETE 처리."""
-    import urllib.request, urllib.error, json
-    for port in (4040, 4041):
+def _find_existing_tunnel() -> str:
+    import urllib.request, json as _json
+    for port in range(4040, 4045):
         try:
             with urllib.request.urlopen(f"http://localhost:{port}/api/tunnels", timeout=2) as r:
-                tunnels = json.loads(r.read())["tunnels"]
+                tunnels = _json.loads(r.read())["tunnels"]
             for t in tunnels:
-                name = t["name"]
-                req = urllib.request.Request(
-                    f"http://localhost:{port}/api/tunnels/{name}",
-                    method="DELETE",
-                )
-                try:
-                    urllib.request.urlopen(req, timeout=2)
-                    log.info(f"기존 터널 삭제: {name}")
-                except Exception:
-                    pass
+                addr = t.get("config", {}).get("addr", "")
+                if str(FLASK_PORT) in addr:
+                    return t["public_url"].replace("http://", "https://")
         except Exception:
             pass
+    return ""
+
 
 def start_ngrok() -> str:
     import time
-    from pyngrok.exception import PyngrokNgrokHTTPError
+    from pyngrok.exception import PyngrokNgrokHTTPError, PyngrokNgrokError
     global public_url
+
+    existing = _find_existing_tunnel()
+    if existing:
+        public_url = existing
+        log.info(f"🌐 기존 ngrok 터널 재사용: {public_url}")
+        return public_url
+
     ngrok_conf.get_default().auth_token = NGROK_TOKEN
-    _close_existing_ngrok_tunnels()
-    for attempt in range(7):
+    for attempt in range(10):
         try:
-            tunnel = ngrok.connect(FLASK_PORT, "http")
+            tunnel    = ngrok.connect(FLASK_PORT, "http")
             public_url = tunnel.public_url.replace("http://", "https://")
             log.info(f"🌐 ngrok URL: {public_url}")
             return public_url
-        except PyngrokNgrokHTTPError as e:
-            if "already online" in str(e) and attempt < 6:
-                wait = 10
-                log.info(f"이전 ngrok 터널 해제 대기 중... ({wait}초, {attempt+1}/6)")
-                time.sleep(wait)
+        except (PyngrokNgrokHTTPError, PyngrokNgrokError) as e:
+            if ("already online" in str(e) or "ERR_NGROK_108" in str(e)) and attempt < 9:
+                log.info(f"ngrok 세션 해제 대기 중... (20초, {attempt+1}/10)")
+                time.sleep(20)
             else:
                 raise
     return public_url
@@ -147,34 +305,38 @@ def parse_excel(data: bytes) -> pd.DataFrame:
         raise ValueError(f"필수 컬럼 누락: {missing}")
     df["비중(%)"] = pd.to_numeric(df["비중(%)"], errors="coerce").fillna(0)
     df["평단가"]  = pd.to_numeric(df["평단가"],  errors="coerce").fillna(0)
+    df["수량"]    = pd.to_numeric(df["수량"],    errors="coerce").fillna(0)
     return df
 
 
 # ────────────────────────────────────────
 # 가격 조회
 # ────────────────────────────────────────
-def build_dashboard_for(uid: int) -> pd.DataFrame:
-    """users[uid] 기준으로 가격 재조회 후 df 갱신"""
-    df_raw = users[uid]["df"].drop(
-        columns=[c for c in ["현재가", "수익률(%)", "USD_KRW"] if c in users[uid]["df"].columns]
+def build_dashboard_for(pname: str) -> pd.DataFrame:
+    p      = portfolios[pname]
+    df_raw = p["df"].drop(
+        columns=[c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in p["df"].columns]
     )
     df = fetch_prices(df_raw)
-    users[uid]["df"]          = df
-    users[uid]["last_update"] = datetime.now(KST)
+    portfolios[pname]["df"]          = df
+    portfolios[pname]["last_update"] = datetime.now(KST)
+    usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
+    save_snapshot(pname, df, usd_krw)
+    save_portfolios(portfolios, active_pname)
     return df
 
 
 # ────────────────────────────────────────
 # 텍스트 요약
 # ────────────────────────────────────────
-def _summary_text(uid: int) -> str:
-    u   = users[uid]
-    df  = u["df"]
-    ts  = u["last_update"].strftime("%m/%d %H:%M") if u["last_update"] else "—"
-    url = f"{public_url}/user/{uid}"
+def _summary_text(pname: str) -> str:
+    p    = portfolios[pname]
+    df   = p["df"]
+    ts   = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
+    name = p.get("name", "포트폴리오")
+    url  = f"{public_url}/p/{pname}"
 
-    lines = [f"📊 *{u.get('name','포트폴리오')} 요약* `{ts} KST`\n"]
-
+    lines = [f"📊 *{name} 요약* `{ts} KST`\n"]
     valid = df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
     if not valid.empty:
         total = (valid["비중(%)"] * valid["수익률(%)"]).sum() / valid["비중(%)"].sum()
@@ -185,11 +347,11 @@ def _summary_text(uid: int) -> str:
     lines.append(f"{'종목':<10} {'비중':>5} {'수익률':>8}")
     lines.append("─" * 26)
     for _, r in df.iterrows():
-        ret = r["수익률(%)"]
+        ret     = r["수익률(%)"]
         ret_str = "   —  " if pd.isna(ret) else f"{'+' if ret>=0 else ''}{ret:.2f}%"
         lines.append(f"{r['종목명']:<10} {r['비중(%)']:>4.1f}% {ret_str:>8}")
     lines.append("```")
-    lines.append(f"\n🔗 [내 대시보드]({url})")
+    lines.append(f"\n🔗 [대시보드]({url})")
     return "\n".join(lines)
 
 
@@ -197,51 +359,41 @@ def _summary_text(uid: int) -> str:
 # 파일 수신 핸들러
 # ────────────────────────────────────────
 async def handle_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+
     doc   = update.message.document
     fname = doc.file_name or ""
-    uid   = update.effective_user.id
-    uname = (update.effective_user.full_name
-             or update.effective_user.username
-             or f"User {uid}")
-
     if not fname.endswith(".xlsx"):
-        await update.message.reply_text(
-            "⚠️ .xlsx 파일만 지원합니다.", parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text("⚠️ .xlsx 파일만 지원합니다.")
         return
 
     msg = await update.message.reply_text("📥 파일 수신 중...")
-
     try:
         file = await ctx.bot.get_file(doc.file_id)
         buf  = await file.download_as_bytearray()
-        await msg.edit_text("🔍 가격 조회 중... (30초~1분 소요)")
+        p_name = portfolios[active_pname].get("name", "포트폴리오") if active_pname in portfolios else "포트폴리오"
+        await msg.edit_text(f"🔍 *{p_name}* 가격 조회 중... (30초~1분 소요)", parse_mode=ParseMode.MARKDOWN)
 
         df_raw = parse_excel(bytes(buf))
-
-        # users 초기 등록 (이름 보존)
-        if uid not in users:
-            users[uid] = {"name": uname, "last_update": None, "df": df_raw}
+        if active_pname not in portfolios:
+            portfolios[active_pname] = {"name": "기본 포트폴리오", "last_update": None, "df": df_raw}
         else:
-            users[uid]["df"] = df_raw  # raw 저장 후 build_dashboard_for 에서 fetch
+            portfolios[active_pname]["df"] = df_raw
 
-        df = await asyncio.get_event_loop().run_in_executor(
-            None, build_dashboard_for, uid
-        )
-
-        ts      = users[uid]["last_update"].strftime("%m/%d %H:%M")
-        summary = _summary_text(uid)
+        df = await asyncio.get_event_loop().run_in_executor(None, build_dashboard_for, active_pname)
+        ts = portfolios[active_pname]["last_update"].strftime("%m/%d %H:%M")
 
         await msg.edit_text(
-            f"✅ *분석 완료* `{ts} KST`\n\n{summary}",
+            f"✅ *분석 완료* `{ts} KST`\n\n{_summary_text(active_pname)}",
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=False,
         )
-        log.info(f"✅ {uname}({uid}) 처리 완료")
+        log.info(f"✅ 처리 완료 → {active_pname}")
 
     except ValueError as e:
         await msg.edit_text(
-            f"❌ 엑셀 형식 오류\n`{e}`\n\n필수컬럼: 종목명, 티커, 국가, 비중(%), 평단가, 통화\n시트명: 포트폴리오",
+            f"❌ 엑셀 형식 오류\n`{e}`\n\n필수컬럼: 종목명, 국가, 비중(%), 평단가, 수량, 통화\n시트명: 포트폴리오",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
@@ -253,42 +405,65 @@ async def handle_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # 커맨드 핸들러
 # ────────────────────────────────────────
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
     await update.message.reply_text(
         "📋 *사용법*\n\n"
-        "1️⃣ `.xlsx` 파일을 이 채팅에 전송\n"
-        "   → 수익률 분석 + 대시보드 URL 제공\n\n"
+        "1️⃣ `.xlsx` 파일 전송 → 현재 활성 포트폴리오에 저장\n\n"
         "2️⃣ 명령어\n"
-        "  `/portfolio` — 내 대시보드 URL\n"
+        "  `/portfolio` — 전체 포트폴리오 목록 + URL\n"
+        "  `/run`       — 활성 포트폴리오 URL\n"
         "  `/refresh`   — 가격 재조회\n"
         "  `/summary`   — 텍스트 요약\n\n"
         "3️⃣ 자동 알림\n"
         "  🇰🇷 KST 15:35 / 🇺🇸 KST 07:00\n\n"
-        "📎 컬럼: 종목명 / 티커 / 국가(KR·US·현금) / 비중(%) / 평단가 / 통화(KRW·USD)",
+        "📎 컬럼: 종목명 / 국가(KR·US·현금) / 비중(%) / 평단가 / 수량 / 통화(KRW·USD)",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    url = f"{public_url}/p/{active_pname}" if active_pname else public_url
+    await update.message.reply_text(
+        f"📊 *대시보드 URL*\n\n🔗 {url}",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+
 
 async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in users:
-        await update.message.reply_text("⚠️ 먼저 .xlsx 파일을 전송해 주세요.")
+    if not _is_owner(update):
         return
-    ts  = users[uid]["last_update"].strftime("%m/%d %H:%M")
-    url = f"{public_url}/user/{uid}"
+    if not portfolios:
+        await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
+        return
+    lines = ["📁 *포트폴리오 목록*\n"]
+    for pname, p in portfolios.items():
+        name = p.get("name", pname)
+        ts   = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
+        mark = "▶ " if pname == active_pname else "   "
+        url  = f"{public_url}/p/{pname}"
+        lines.append(f"{mark}*{name}* `{ts}`\n🔗 {url}")
     await update.message.reply_text(
-        f"📊 *내 대시보드*\n\n🕐 기준: `{ts} KST`\n🔗 {url}",
+        "\n\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
     )
 
+
 async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in users:
+    if not _is_owner(update):
+        return
+    if active_pname not in portfolios:
         await update.message.reply_text("⚠️ 먼저 .xlsx 파일을 전송해 주세요.")
         return
     msg = await update.message.reply_text("🔄 가격 재조회 중...")
     try:
-        await asyncio.get_event_loop().run_in_executor(None, build_dashboard_for, uid)
-        ts  = users[uid]["last_update"].strftime("%m/%d %H:%M")
-        url = f"{public_url}/user/{uid}"
+        await asyncio.get_event_loop().run_in_executor(None, build_dashboard_for, active_pname)
+        ts  = portfolios[active_pname]["last_update"].strftime("%m/%d %H:%M")
+        url = f"{public_url}/p/{active_pname}"
         await msg.edit_text(
             f"✅ *업데이트 완료*\n\n🕐 `{ts} KST`\n🔗 {url}",
             parse_mode=ParseMode.MARKDOWN,
@@ -296,13 +471,15 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ 오류: {e}")
 
+
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in users:
+    if not _is_owner(update):
+        return
+    if active_pname not in portfolios:
         await update.message.reply_text("⚠️ 먼저 .xlsx 파일을 전송해 주세요.")
         return
     await update.message.reply_text(
-        _summary_text(uid),
+        _summary_text(active_pname),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
@@ -312,33 +489,57 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # 자동 스케줄
 # ────────────────────────────────────────
 async def scheduled_send(label: str):
-    if not users:
-        log.info(f"⏰ {label} — 유저 없음, 건너뜀")
+    if not portfolios:
+        log.info(f"⏰ {label} — 포트폴리오 없음, 건너뜀")
         return
     log.info(f"⏰ 자동 전송 시작 ({label})")
     bot = Bot(token=TELEGRAM_TOKEN)
-    for uid in list(users.keys()):
+    for pname in list(portfolios.keys()):
+        p = portfolios[pname]
+        if p.get("df") is None or len(p.get("df", [])) == 0:
+            continue
         try:
-            await asyncio.get_event_loop().run_in_executor(None, build_dashboard_for, uid)
-            text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(uid)}"
+            await asyncio.get_event_loop().run_in_executor(None, build_dashboard_for, pname)
+            text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(pname)}"
             await bot.send_message(
-                chat_id=uid,
+                chat_id=TELEGRAM_CHAT_ID,
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
-            log.info(f"  → {users[uid].get('name')}({uid}) 전송 완료")
+            log.info(f"  → {p.get('name')} ({pname}) 전송 완료")
         except Exception as e:
-            log.error(f"  → {uid} 전송 실패: {e}")
+            log.error(f"  → {pname} 전송 실패: {e}")
+
+
+async def scheduled_snapshot():
+    """가격 재조회 없이 현재 df 기준으로 모든 포트폴리오 스냅샷 저장"""
+    if not portfolios:
+        return
+    for pname, p in list(portfolios.items()):
+        df = p.get("df")
+        if df is None or len(df) == 0:
+            continue
+        try:
+            usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns else 1370.0
+            save_snapshot(pname, df, usd_krw)
+            log.info(f"  📸 자정 스냅샷 저장: {p.get('name', pname)}")
+        except Exception as e:
+            log.error(f"  ⚠️  자정 스냅샷 실패 ({pname}): {e}")
 
 
 # ────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────
 def main():
+    global portfolios, active_pname
+
     log.info("=" * 55)
-    log.info("  📊  포트폴리오 봇 시작 (멀티유저)")
+    log.info("  📊  포트폴리오 봇 시작 (멀티 포트폴리오)")
     log.info("=" * 55)
+
+    portfolios, active_pname = load_portfolios()
+    log.info(f"  📁 포트폴리오 {len(portfolios)}개 로드, 활성: {active_pname}")
 
     threading.Thread(target=run_flask, daemon=True).start()
     log.info(f"  🖥️  Flask 서버 시작 (port {FLASK_PORT})")
@@ -348,6 +549,7 @@ def main():
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
     tg_app.add_handler(CommandHandler("start",     cmd_help))
     tg_app.add_handler(CommandHandler("help",      cmd_help))
+    tg_app.add_handler(CommandHandler("run",       cmd_run))
     tg_app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     tg_app.add_handler(CommandHandler("refresh",   cmd_refresh))
     tg_app.add_handler(CommandHandler("summary",   cmd_summary))
@@ -364,6 +566,10 @@ def main():
         day_of_week="tue-sat", hour=7, minute=0,
         kwargs={"label": "🇺🇸 US 장 마감"},
     )
+    scheduler.add_job(
+        scheduled_snapshot, "cron",
+        hour=0, minute=1,
+    )
 
     async def post_init(application):
         scheduler.start()
@@ -371,7 +577,7 @@ def main():
     tg_app.post_init = post_init
 
     log.info(f"\n  ✅ 봇 실행 중")
-    log.info(f"  🌐 허브 URL: {public_url}")
+    log.info(f"  🌐 URL: {public_url}")
     log.info(f"  📱 텔레그램에서 .xlsx 파일을 전송하세요\n")
 
     tg_app.run_polling()

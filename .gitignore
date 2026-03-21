@@ -4,3 +4,9 @@ __pycache__/
 .env
 portfolio.xlsx
 C:/cacert.pem
+data/
+.claude/
+Performance-Summary-Bot/
+bot_out.txt
+bot_output.log
+*.log
