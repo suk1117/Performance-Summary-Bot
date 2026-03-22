@@ -19,11 +19,17 @@ _EMPTY_COLS   = ["종목명", "국가", "비중(%)", "평단가", "수량", "통
 
 
 # ─── 내부 헬퍼 ───────────────────────────────────────
+def _safe_pname(pname: str) -> str:
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", pname):
+        raise ValueError(f"잘못된 포트폴리오 ID: {pname!r}")
+    return pname
+
 def _history_path(pname: str) -> str:
-    return os.path.join(DATA_DIR, f"history_{pname}.json")
+    return os.path.join(DATA_DIR, f"history_{_safe_pname(pname)}.json")
 
 def _cashflow_path(pname: str) -> str:
-    return os.path.join(DATA_DIR, f"cashflow_{pname}.json")
+    return os.path.join(DATA_DIR, f"cashflow_{_safe_pname(pname)}.json")
 
 def _raw() -> dict:
     if not os.path.exists(PORTFOLIOS_FILE):
