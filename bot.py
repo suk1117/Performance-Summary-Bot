@@ -30,7 +30,6 @@ load_dotenv()
 import pandas as pd
 import pytz
 from flask import Flask, abort, jsonify, redirect, request
-from pyngrok import ngrok, conf as ngrok_conf
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, Bot
 from telegram.ext import (
@@ -67,6 +66,11 @@ portfolios:   dict = {}
 active_pname: str  = ""
 public_url:   str  = ""
 
+# ── 대시보드 빌드 중복 방지 ──
+_build_lock  = threading.Lock()   # _building / _hist_check 접근용
+_building:   set  = set()         # 현재 빌드 중인 pname
+_hist_check: dict = {}            # pname -> "YYYY-MM-DD" (오늘 이미 완료)
+
 app_flask    = Flask(__name__)
 REQUIRED_COLS = {"종목명", "국가", "평단가", "수량", "통화"}
 
@@ -101,6 +105,8 @@ def portfolio_page(pname: str):
     active_pname = pname
     save_portfolios(portfolios, active_pname)
     p = portfolios[pname]
+    if p.get("df") is not None and len(p["df"]) > 0:
+        _trigger_build_if_needed(pname)
     return build_user_html(
         p["df"],
         display_name=p.get("name", "포트폴리오"),
@@ -266,6 +272,7 @@ def _find_existing_tunnel() -> str:
 
 def start_ngrok() -> str:
     import time
+    from pyngrok import ngrok, conf as ngrok_conf
     from pyngrok.exception import PyngrokNgrokHTTPError, PyngrokNgrokError
     global public_url
 
@@ -306,6 +313,26 @@ def build_dashboard_for(pname: str) -> pd.DataFrame:
     save_snapshot(pname, df, usd_krw)
     save_portfolios(portfolios, active_pname)
     return df
+
+
+def _build_dashboard_bg(pname: str) -> None:
+    """백그라운드 스레드용 wrapper — 완료 후 _building에서 제거."""
+    try:
+        build_dashboard_for(pname)
+    finally:
+        with _build_lock:
+            _building.discard(pname)
+
+
+def _trigger_build_if_needed(pname: str) -> None:
+    """오늘 아직 빌드하지 않았고, 현재 빌드 중이 아닐 때만 스레드 1개 생성."""
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    with _build_lock:
+        if _hist_check.get(pname) == today or pname in _building:
+            return
+        _building.add(pname)
+        _hist_check[pname] = today  # 스레드 시작 전에 기록 (중복 방지)
+    threading.Thread(target=_build_dashboard_bg, args=(pname,), daemon=True).start()
 
 
 # ────────────────────────────────────────

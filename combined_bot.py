@@ -7,59 +7,43 @@ from __future__ import annotations
 # =======================================================
 # storage.py
 # =======================================================
-"""
-storage.py  ─  멀티 포트폴리오 데이터 영구 저장/로드
-  - portfolios.json        : 전체 포트폴리오 메타 + df
-  - history_{pname}.json   : 포트폴리오별 날짜 스냅샷
-  - cashflow_{pname}.json  : 포트폴리오별 자금 기록
-"""
 import json
 import os
-import secrets as _secrets
 from datetime import datetime, date
 import pandas as pd
 
-BASE_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(BASE_DATA_DIR, exist_ok=True)
+DATA_DIR        = os.path.join(os.path.dirname(__file__), "data")
+PORTFOLIOS_FILE = os.path.join(DATA_DIR, "portfolios.json")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 _NUMERIC_COLS = ["비중(%)", "평단가", "수량", "현재가", "수익률(%)", "등락률(%)", "USD_KRW"]
 _EMPTY_COLS   = ["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]
 
 
 # ─── 내부 헬퍼 ───────────────────────────────────────
-def _user_dir(uid: int) -> str:
-    d = os.path.join(BASE_DATA_DIR, f"user_{uid}")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def _portfolios_file(uid: int) -> str:
-    return os.path.join(_user_dir(uid), "portfolios.json")
-
 def _safe_pname(pname: str) -> str:
-    """pname이 안전한 형식(영숫자·밑줄·하이픈)인지 검증"""
     import re
     if not re.fullmatch(r"[A-Za-z0-9_-]+", pname):
         raise ValueError(f"잘못된 포트폴리오 ID: {pname!r}")
     return pname
 
-def _history_path(uid: int, pname: str) -> str:
-    return os.path.join(_user_dir(uid), f"history_{_safe_pname(pname)}.json")
+def _history_path(pname: str) -> str:
+    return os.path.join(DATA_DIR, f"history_{_safe_pname(pname)}.json")
 
-def _cashflow_path(uid: int, pname: str) -> str:
-    return os.path.join(_user_dir(uid), f"cashflow_{_safe_pname(pname)}.json")
+def _cashflow_path(pname: str) -> str:
+    return os.path.join(DATA_DIR, f"cashflow_{_safe_pname(pname)}.json")
 
-def _raw(uid: int) -> dict:
-    fpath = _portfolios_file(uid)
-    if not os.path.exists(fpath):
+def _raw() -> dict:
+    if not os.path.exists(PORTFOLIOS_FILE):
         return {"active": "", "next_id": 1, "items": {}}
     try:
-        with open(fpath, "r", encoding="utf-8") as f:
+        with open(PORTFOLIOS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {"active": "", "next_id": 1, "items": {}}
 
-def _save_raw(uid: int, data: dict):
-    with open(_portfolios_file(uid), "w", encoding="utf-8") as f:
+def _save_raw(data: dict):
+    with open(PORTFOLIOS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
 
 def _df_from_records(records: list) -> pd.DataFrame:
@@ -70,62 +54,48 @@ def _df_from_records(records: list) -> pd.DataFrame:
     return df
 
 
-# ─── 기존 data/ → data/user_{uid}/ 마이그레이션 ──────
-def _migrate(uid: int):
-    user_dir       = os.path.join(BASE_DATA_DIR, f"user_{uid}")
-    new_portfolios = os.path.join(user_dir, "portfolios.json")
-    if os.path.exists(new_portfolios):
+# ─── 구버전 단일 포트폴리오 마이그레이션 ─────────────
+def _migrate():
+    if os.path.exists(PORTFOLIOS_FILE):
         return
-    os.makedirs(user_dir, exist_ok=True)
-    old_multi  = os.path.join(BASE_DATA_DIR, "portfolios.json")
-    old_single = os.path.join(BASE_DATA_DIR, "portfolio.json")
-    if os.path.exists(old_multi):
-        import shutil
-        shutil.copy2(old_multi, new_portfolios)
-        for fname in os.listdir(BASE_DATA_DIR):
-            if fname.startswith("history_") or fname.startswith("cashflow_"):
-                src = os.path.join(BASE_DATA_DIR, fname)
-                dst = os.path.join(user_dir, fname)
-                if not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-        print(f"✅ data/ → user_{uid}/ 마이그레이션 완료")
-    elif os.path.exists(old_single):
-        try:
-            with open(old_single, "r", encoding="utf-8") as f:
-                old = json.load(f)
-            pname = "p1"
-            raw = {
-                "active":  pname,
-                "next_id": 2,
-                "items": {
-                    pname: {
-                        "name":        old.get("name", "기본 포트폴리오"),
-                        "last_update": old.get("last_update"),
-                        "df":          old.get("df", []),
-                    }
-                },
-            }
-            with open(new_portfolios, "w", encoding="utf-8") as f:
-                json.dump(raw, f, ensure_ascii=False, indent=2)
-            import shutil
-            for old_name, new_name in [
-                ("cashflow.json", f"cashflow_{pname}.json"),
-                ("history.json",  f"history_{pname}.json"),
-            ]:
-                src = os.path.join(BASE_DATA_DIR, old_name)
-                dst = os.path.join(user_dir, new_name)
-                if os.path.exists(src) and not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-            print(f"✅ portfolio.json → user_{uid}/ 마이그레이션 완료")
-        except Exception as e:
-            print(f"⚠️  마이그레이션 오류: {e}")
+    old_file = os.path.join(DATA_DIR, "portfolio.json")
+    if not os.path.exists(old_file):
+        return
+    try:
+        with open(old_file, "r", encoding="utf-8") as f:
+            old = json.load(f)
+        pname = "p1"
+        raw = {
+            "active":  pname,
+            "next_id": 2,
+            "items": {
+                pname: {
+                    "name":        old.get("name", "기본 포트폴리오"),
+                    "last_update": old.get("last_update"),
+                    "df":          old.get("df", []),
+                }
+            },
+        }
+        _save_raw(raw)
+        # 파일 마이그레이션
+        for old_name, new_name in [
+            ("cashflow.json",  f"cashflow_{pname}.json"),
+            ("history.json",   f"history_{pname}.json"),
+        ]:
+            src = os.path.join(DATA_DIR, old_name)
+            dst = os.path.join(DATA_DIR, new_name)
+            if os.path.exists(src) and not os.path.exists(dst):
+                os.rename(src, dst)
+        print(f"✅ portfolio.json → portfolios.json 마이그레이션 완료")
+    except Exception as e:
+        print(f"⚠️  마이그레이션 오류: {e}")
 
 
 # ─── 포트폴리오 로드/저장 ─────────────────────────────
-def load_portfolios(uid: int) -> tuple[dict, str]:
+def load_portfolios() -> tuple[dict, str]:
     """(portfolios dict, active_pname) 반환. 없으면 기본 포트폴리오 생성."""
-    _migrate(uid)
-    raw = _raw(uid)
+    _migrate()
+    raw = _raw()
     items = {}
     for pname, p in raw.get("items", {}).items():
         last_update = None
@@ -150,7 +120,7 @@ def load_portfolios(uid: int) -> tuple[dict, str]:
         raw["active"]  = pname
         raw["next_id"] = 2
         raw["items"]   = {"p1": {"name": "기본 포트폴리오", "last_update": None, "df": []}}
-        _save_raw(uid, raw)
+        _save_raw(raw)
 
     active = raw.get("active", "")
     if active not in items:
@@ -159,9 +129,9 @@ def load_portfolios(uid: int) -> tuple[dict, str]:
     return items, active
 
 
-def save_portfolios(uid: int, portfolios: dict, active_pname: str):
+def save_portfolios(portfolios: dict, active_pname: str):
     """portfolios dict + active → JSON 저장"""
-    raw = _raw(uid)
+    raw = _raw()
     raw["active"] = active_pname
     out = {}
     for pname, p in portfolios.items():
@@ -171,38 +141,38 @@ def save_portfolios(uid: int, portfolios: dict, active_pname: str):
             "df":          p["df"].to_dict(orient="records") if p.get("df") is not None else [],
         }
     raw["items"] = out
-    _save_raw(uid, raw)
+    _save_raw(raw)
 
 
-def create_portfolio(uid: int, name: str) -> str:
+def create_portfolio(name: str) -> str:
     """새 포트폴리오 생성, pname 반환"""
-    raw = _raw(uid)
+    raw = _raw()
     next_id = raw.get("next_id", 1)
     pname   = f"p{next_id}"
     raw["next_id"] = next_id + 1
     if "items" not in raw:
         raw["items"] = {}
     raw["items"][pname] = {"name": name, "last_update": None, "df": []}
-    _save_raw(uid, raw)
+    _save_raw(raw)
     return pname
 
 
-def rename_portfolio(uid: int, pname: str, new_name: str):
-    raw = _raw(uid)
+def rename_portfolio(pname: str, new_name: str):
+    raw = _raw()
     if pname in raw.get("items", {}):
         raw["items"][pname]["name"] = new_name
-        _save_raw(uid, raw)
+        _save_raw(raw)
 
 
-def delete_portfolio(uid: int, pname: str) -> str:
+def delete_portfolio(pname: str) -> str:
     """포트폴리오 삭제. 새 active pname 반환."""
-    raw = _raw(uid)
+    raw = _raw()
     items = raw.get("items", {})
     if pname in items:
         del items[pname]
     raw["items"] = items
     # 관련 파일 삭제
-    for path in [_history_path(uid, pname), _cashflow_path(uid, pname)]:
+    for path in [_history_path(pname), _cashflow_path(pname)]:
         if os.path.exists(path):
             try:
                 os.remove(path)
@@ -212,13 +182,13 @@ def delete_portfolio(uid: int, pname: str) -> str:
     if raw.get("active") == pname:
         remaining = list(items.keys())
         raw["active"] = remaining[0] if remaining else ""
-    _save_raw(uid, raw)
+    _save_raw(raw)
     return raw.get("active", "")
 
 
 # ─── 히스토리 스냅샷 ──────────────────────────────────
-def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
-    fpath   = _history_path(uid, pname)
+def save_snapshot(pname: str, df: pd.DataFrame, usd_krw: float):
+    fpath   = _history_path(pname)
     history = {}
     if os.path.exists(fpath):
         try:
@@ -249,7 +219,7 @@ def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
             "weight": float(r["비중(%)"]),
         }
 
-    net_investment   = get_net_investment(uid, pname)
+    net_investment   = get_net_investment(pname)
     cash_krw         = max(0.0, net_investment - stock_eval_krw) if net_investment > 0 else 0.0
     total_assets     = stock_eval_krw + cash_krw
     total_return_pct = (stock_eval_krw - total_buy) / total_buy * 100 if total_buy > 0 else 0.0
@@ -267,8 +237,8 @@ def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-def load_history(uid: int, pname: str) -> dict:
-    fpath = _history_path(uid, pname)
+def load_history(pname: str) -> dict:
+    fpath = _history_path(pname)
     if not os.path.exists(fpath):
         return {}
     try:
@@ -279,13 +249,13 @@ def load_history(uid: int, pname: str) -> dict:
 
 
 # ─── 자금 기록 ────────────────────────────────────────
-def save_cashflow(uid: int, pname: str, records: list):
-    with open(_cashflow_path(uid, pname), "w", encoding="utf-8") as f:
+def save_cashflow(pname: str, records: list):
+    with open(_cashflow_path(pname), "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
-def load_cashflow(uid: int, pname: str) -> list:
-    fpath = _cashflow_path(uid, pname)
+def load_cashflow(pname: str) -> list:
+    fpath = _cashflow_path(pname)
     if not os.path.exists(fpath):
         return []
     try:
@@ -295,49 +265,33 @@ def load_cashflow(uid: int, pname: str) -> list:
         return []
 
 
-def add_cashflow(uid: int, pname: str, type_: str, amount: float, memo: str):
-    records = load_cashflow(uid, pname)
+def add_cashflow(pname: str, type_: str, amount: float, memo: str):
+    records = load_cashflow(pname)
     records.append({
         "date":   date.today().isoformat(),
         "type":   type_,
         "amount": amount,
         "memo":   memo,
     })
-    save_cashflow(uid, pname, records)
+    save_cashflow(pname, records)
 
 
-def get_net_investment(uid: int, pname: str) -> float:
-    records = load_cashflow(uid, pname)
+def get_net_investment(pname: str) -> float:
+    records = load_cashflow(pname)
     return (
         sum(r["amount"] for r in records if r["type"] == "in")
         - sum(r["amount"] for r in records if r["type"] == "out")
     )
 
-
-def get_user_token(uid: int) -> str:
-    """사용자별 접근 토큰 반환 (없으면 생성 후 저장)"""
-    data = _raw(uid)
-    if "token" not in data:
-        data["token"] = _secrets.token_urlsafe(16)
-        _save_raw(uid, data)
-    return data["token"]
-
 # =======================================================
 # price_fetcher.py
 # =======================================================
-"""
-price_fetcher.py
-현재가 조회 + 수익률 계산
-  - KR 주식: 네이버 금융 (종목명 → 티커 검색 → 현재가)
-  - US 주식: 네이버 금융 (AAPL:NASDAQ 형식)
-  - 환율:    네이버 금융 (FX_USDKRW)
-"""
 import logging
 import requests
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 
-_pf_log = logging.getLogger("price_fetcher")
+log = logging.getLogger(__name__)
 
 # ── 공통 헤더 ──
 HEADERS = {
@@ -372,17 +326,17 @@ def _search_kr_ticker(name: str) -> str | None:
             if item.get("name") == name and item.get("nationCode") == "KOR":
                 code = item["code"]
                 _kr_ticker_cache[name] = code
-                _pf_log.info(f"티커 검색: {name} -> {code}")
+                log.info(f"티커 검색: {name} → {code}")
                 return code
         # 없으면 첫 번째 KOR 종목
         for item in items:
             if item.get("nationCode") == "KOR":
                 code = item["code"]
                 _kr_ticker_cache[name] = code
-                _pf_log.info(f"티커 검색: {name} -> {code} (첫 번째 결과)")
+                log.info(f"티커 검색: {name} → {code} (첫 번째 결과)")
                 return code
     except Exception as e:
-        _pf_log.warning(f"티커 검색 실패 ({name}): {e}")
+        log.warning(f"티커 검색 실패 ({name}): {e}")
     return None
 
 
@@ -415,7 +369,7 @@ def _naver_stock_price(code: str) -> tuple[float | None, float | None]:
                 change = None
         return price, change
     except Exception as e:
-        _pf_log.warning(f"네이버 가격 조회 실패 ({code}): {e}")
+        log.warning(f"네이버 가격 조회 실패 ({code}): {e}")
     return None, None
 
 
@@ -448,10 +402,10 @@ def get_us_price(ticker: str) -> tuple[float | None, float | None]:
                     prev = float(hist["Close"].iloc[-2])
         change = round((float(price) - float(prev)) / float(prev) * 100, 2) if price and prev else None
         if price:
-            _pf_log.info(f"US 가격 조회: {ticker} = ${float(price):,.2f}")
+            log.info(f"US 가격 조회: {ticker} = ${float(price):,.2f}")
             return float(price), change
     except Exception as e:
-        _pf_log.warning(f"US 가격 조회 실패 ({ticker}): {e}")
+        log.warning(f"US 가격 조회 실패 ({ticker}): {e}")
 
     return None, None
 
@@ -467,7 +421,7 @@ def get_usd_krw() -> float:
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
     except Exception as e:
-        _pf_log.warning(f"get_usd_krw yfinance 실패: {e}")
+        log.warning(f"get_usd_krw yfinance 실패: {e}")
 
     # fallback: 네이버 금융
     try:
@@ -482,7 +436,7 @@ def get_usd_krw() -> float:
         if price_str:
             return float(str(price_str).replace(",", ""))
     except Exception as e:
-        _pf_log.warning(f"get_usd_krw 네이버 fallback 실패: {e}")
+        log.warning(f"get_usd_krw 네이버 fallback 실패: {e}")
 
     return 1370.0
 
@@ -493,7 +447,7 @@ def get_usd_krw() -> float:
 def _fetch_one(row: dict) -> tuple[float | None, float | None]:
     name    = str(row["종목명"]).strip()
     country = str(row["국가"]).strip()
-    _pf_log.info(f"  🔍 {name} ({country})")
+    log.info(f"  🔍 {name} ({country})")
     if country == "KR":
         return get_kr_price(name)
     elif country == "US":
@@ -508,7 +462,7 @@ def fetch_prices(df: pd.DataFrame) -> pd.DataFrame:
     # 현금 행은 build_user_html에서 자동 계산하므로 제거
     df = df[df["국가"] != "현금"].reset_index(drop=True)
     usd_krw = get_usd_krw()
-    _pf_log.info(f"  💱 USD/KRW: {usd_krw:,.1f}")
+    log.info(f"  💱 USD/KRW: {usd_krw:,.1f}")
 
     rows = df.to_dict("records")
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -554,16 +508,12 @@ def fetch_prices(df: pd.DataFrame) -> pd.DataFrame:
 # =======================================================
 # html_builder.py
 # =======================================================
-"""
-html_builder.py
-포트폴리오 HTML 인포그래픽 생성 모듈 (미니멀 클린 라이트 테마)
-"""
 import json
 import pandas as pd
 from datetime import datetime, date, timedelta
 
 
-def _build_portfolio_tabs(all_portfolios: dict, current_pname: str, uid: int = 0, token: str = "") -> str:
+def _build_portfolio_tabs(all_portfolios: dict, current_pname: str) -> str:
     """포트폴리오 탭 HTML 생성"""
     if not all_portfolios:
         return ""
@@ -590,7 +540,7 @@ def _build_portfolio_tabs(all_portfolios: dict, current_pname: str, uid: int = 0
                 f'{name}{ren_btn}{del_btn}</span>'
             )
         else:
-            tabs += f'<a href="/u/{uid}/p/{pname}?t={token}" class="tab">{name}</a>'
+            tabs += f'<a href="/p/{pname}" class="tab">{name}</a>'
     tabs += (
         '<button onclick="openNewPortfolioModal()" title="새 포트폴리오" '
         'style="display:inline-flex;align-items:center;height:52px;padding:0 10px;'
@@ -606,8 +556,6 @@ def build_user_html(
     cashflows: list = None,
     pname: str = "",
     all_portfolios: dict = None,
-    uid: int = 0,
-    token: str = "",
 ) -> str:
     today_str  = datetime.now().strftime("%Y.%m.%d %H:%M")
     cashflows  = cashflows or []
@@ -616,33 +564,17 @@ def build_user_html(
         sum(c["amount"] for c in cashflows if c["type"] == "in")
         - sum(c["amount"] for c in cashflows if c["type"] == "out")
     )
-    portfolio_tabs = _build_portfolio_tabs(all_portfolios or {}, pname, uid, token)
+    portfolio_tabs = _build_portfolio_tabs(all_portfolios or {}, pname)
 
     # 수익률 추이 히스토리 데이터
-    hist        = load_history(uid, pname or "")
+    hist        = load_history(pname or "")
     hist_dates  = sorted(hist.keys())
-    # 첫날 기준 누적 수익률 계산 (첫날 = 0%)
-    _raw_twr = [hist[d].get("total_return") for d in hist_dates]
-    _raw_mwr = [hist[d].get("mwr") for d in hist_dates]
-
-    # 각 시리즈에서 None이 아닌 첫 번째 값을 기준점(0%)으로 설정
-    _twr_base = next((v for v in _raw_twr if v is not None), None)
-    _mwr_base = next((v for v in _raw_mwr if v is not None), None)
-
-    hist_twr_vals = [
-        round(v - _twr_base, 4) if (v is not None and _twr_base is not None) else None
-        for v in _raw_twr
-    ]
-    hist_mwr_vals = [
-        round(v - _mwr_base, 4) if (v is not None and _mwr_base is not None) else None
-        for v in _raw_mwr
-    ]
-    hist_dates_js    = json.dumps(hist_dates)
-    hist_twr_js      = json.dumps([round(v, 4) if v is not None else None for v in hist_twr_vals])
-    hist_mwr_js      = json.dumps([round(v, 4) if v is not None else None for v in hist_mwr_vals])
-    hist_raw_twr_js  = json.dumps([round(v, 4) if v is not None else None for v in _raw_twr])
-    show_hist        = len(hist_dates) >= 1
-    hist_today_iso   = date.today().isoformat()
+    hist_twr_vals = [hist[d].get("total_return") for d in hist_dates]
+    hist_mwr_vals = [hist[d].get("mwr") for d in hist_dates]
+    hist_dates_js = json.dumps(hist_dates)
+    hist_twr_js   = json.dumps([round(v, 4) if v is not None else None for v in hist_twr_vals])
+    hist_mwr_js   = json.dumps([round(v, 4) if v is not None else None for v in hist_mwr_vals])
+    show_hist     = len(hist_dates) > 1
 
     # 기간별 수익률 계산 (MWR 기준)
     def _period_ret(days):
@@ -933,7 +865,7 @@ def build_user_html(
             f'<td class="num">—</td>'
             f'<td class="num">—</td>'
             f'<td class="num">{cash_weight:.1f}%</td>'
-            f'<td class="num">—</td>'
+            f'<td class="num">{fmt_krw(net_investment)}</td>'
             f'<td class="num">{fmt_krw(cash_krw)}</td>'
             f'<td></td>'
             f'</tr>'
@@ -965,70 +897,29 @@ def build_user_html(
     if show_hist:
         hist_chart_html = (
             '<div class="card" style="margin-bottom:16px">'
-            '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
-            '<div class="card-title" style="margin-bottom:0">수익률 추이</div>'
-            '<div style="display:flex;gap:6px;flex-wrap:wrap">'
-            '<button id="idx-btn-KOSPI"  onclick="toggleIndex(\'KOSPI\')"  '
-            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
-            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
-            'transition:all .15s">KOSPI</button>'
-            '<button id="idx-btn-KOSDAQ" onclick="toggleIndex(\'KOSDAQ\')" '
-            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
-            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
-            'transition:all .15s">KOSDAQ</button>'
-            '<button id="idx-btn-NASDAQ" onclick="toggleIndex(\'NASDAQ\')" '
-            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
-            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
-            'transition:all .15s">NASDAQ</button>'
-            '<button id="idx-btn-SP500"  onclick="toggleIndex(\'S&P500\')" '
-            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
-            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
-            'transition:all .15s">S&P500</button>'
-            '</div></div>'
+            '<div class="card-title">수익률 추이</div>'
             '<div style="position:relative;height:220px">'
             '<canvas id="histChart"></canvas>'
             '</div></div>'
         )
-        hist_chart_js = f"""
-// ── 히스토리 차트 ──
-const _histLabels = {hist_dates_js};
-const _histData   = {hist_raw_twr_js};
-const _histStart  = _histLabels.length > 0 ? _histLabels[0] : null;
-
-// 오늘 현재값(총 손익 %) 마지막 포인트로 주입
-(function() {{
-  const today = "{hist_today_iso}";
-  const cur   = {total_return};
-  if (_histLabels.length === 0 || _histLabels[_histLabels.length - 1] !== today) {{
-    _histLabels.push(today);
-    _histData.push(cur);
-  }} else {{
-    _histData[_histData.length - 1] = cur;
-  }}
-}})();
-
-const _idxColors = {{
-  "KOSPI":  "#f59e0b",
-  "KOSDAQ": "#10b981",
-  "NASDAQ": "#ef4444",
-  "S&P500": "#f97316",
-}};
-const _idxVisible = {{ "KOSPI": false, "KOSDAQ": false, "NASDAQ": false, "S&P500": false }};
-const _idxCache   = {{}};
-
-const histChart = new Chart(document.getElementById("histChart"), {{
+        hist_chart_js = f"""new Chart(document.getElementById("histChart"), {{
   type: "line",
   data: {{
-    labels: _histLabels,
+    labels: {hist_dates_js},
     datasets: [
       {{
-        label: "계좌 누적 수익률",
-        data: _histData,
+        label: "가중 수익률",
+        data: {hist_twr_js},
+        borderColor: "#0ea5e9",
+        backgroundColor: "rgba(14,165,233,.08)",
+        tension: 0.3, fill: true, pointRadius: 3, borderWidth: 2,
+      }},
+      {{
+        label: "실제 수익률(MWR)",
+        data: {hist_mwr_js},
         borderColor: "#6366f1",
-        backgroundColor: "rgba(99,102,241,.08)",
-        tension: 0.3, fill: true,
-        pointRadius: 0, pointHoverRadius: 5,
-        borderWidth: 2, spanGaps: true,
+        backgroundColor: "rgba(99,102,241,.04)",
+        tension: 0.3, fill: false, pointRadius: 3, borderWidth: 2, spanGaps: true,
       }},
     ],
   }},
@@ -1038,7 +929,6 @@ const histChart = new Chart(document.getElementById("histChart"), {{
     plugins: {{
       legend: {{ position: "top", labels: {{ boxWidth: 9, padding: 10, font: {{ size: 11 }} }} }},
       tooltip: {{
-        mode: "index", intersect: false,
         callbacks: {{
           label: function(c) {{
             var v = c.parsed.y;
@@ -1052,67 +942,7 @@ const histChart = new Chart(document.getElementById("histChart"), {{
       y: {{ grid: {{ color: "#f1f5f9" }}, ticks: {{ color: "#94a3b8", callback: function(v) {{ return (v >= 0 ? "+" : "") + v + "%"; }} }} }},
     }},
   }},
-}});
-
-// 지수 데이터를 차트 labels에 맞게 보간
-function _alignToLabels(idxData, labels) {{
-  const map = {{}};
-  idxData.forEach(d => {{ map[d.date] = d.return; }});
-  return labels.map(d => map[d] != null ? map[d] : null);
-}}
-
-window.toggleIndex = async function(name) {{
-  const btn     = document.getElementById("idx-btn-" + name.replace("&", ""));
-  const color   = _idxColors[name];
-  const visible = _idxVisible[name];
-
-  if (visible) {{
-    // 숨기기
-    _idxVisible[name] = false;
-    btn.style.background  = "#fff";
-    btn.style.color       = "#64748b";
-    btn.style.borderColor = "#e2e8f0";
-    const idx = histChart.data.datasets.findIndex(d => d.label === name);
-    if (idx > 0) histChart.data.datasets.splice(idx, 1);
-    histChart.update();
-    return;
-  }}
-
-  // 보이기
-  _idxVisible[name] = true;
-  btn.style.background  = color;
-  btn.style.color       = "#fff";
-  btn.style.borderColor = color;
-
-  // 캐시 없으면 API 조회
-  if (!_idxCache[name] && _histStart) {{
-    try {{
-      const r = await fetch(`/u/${{UID}}/api/index_returns?start=${{_histStart}}&t=${{TOKEN}}`);
-      const all = await r.json();
-      Object.keys(all).forEach(k => {{ _idxCache[k] = all[k]; }});
-    }} catch(e) {{
-      console.error("지수 데이터 조회 실패", e);
-      _idxVisible[name] = false;
-      btn.style.background = "#fff";
-      btn.style.color = "#64748b";
-      return;
-    }}
-  }}
-
-  const aligned = _alignToLabels(_idxCache[name] || [], histChart.data.labels);
-  histChart.data.datasets.push({{
-    label: name,
-    data: aligned,
-    borderColor: color,
-    backgroundColor: "transparent",
-    tension: 0.3, fill: false,
-    pointRadius: 0, pointHoverRadius: 5,
-    borderWidth: 1.5, spanGaps: true,
-    borderDash: [],
-  }});
-  histChart.update();
-}}
-"""
+}});"""
     else:
         hist_chart_html = ""
         hist_chart_js   = ""
@@ -1663,8 +1493,6 @@ tbody td {{ padding:12px 10px; }}
 <script>
 // ── 기본 설정 ──
 const PNAME = "{pname_js}";
-const UID   = {uid};
-const TOKEN = "{token}";
 let _editMode = false, _editName = '';
 let _renamePname = '';
 
@@ -1722,7 +1550,7 @@ async function saveStock() {{
   }};
   if (!isCash && !payload.종목명) {{ alert('종목명을 입력하세요'); btn.disabled=false; btn.textContent='저장'; return; }}
   try {{
-    const res = await fetch(`/u/${{UID}}/api/p/${{PNAME}}/stock`, {{
+    const res = await fetch(`/api/p/${{PNAME}}/stock`, {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify(payload),
@@ -1734,7 +1562,7 @@ async function saveStock() {{
 
 async function deleteStock(name) {{
   if (!confirm(`"${{name}}" 종목을 삭제할까요?`)) return;
-  const res = await fetch(`/u/${{UID}}/api/p/${{PNAME}}/stock/${{encodeURIComponent(name)}}`, {{method:'DELETE'}});
+  const res = await fetch(`/api/p/${{PNAME}}/stock/${{encodeURIComponent(name)}}`, {{method:'DELETE'}});
   if (res.ok) {{ location.reload(); }}
   else {{ const e = await res.json(); alert('오류: ' + e.error); }}
 }}
@@ -1746,7 +1574,7 @@ async function refreshPrices() {{
   try {{
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), 120000);
-    const res  = await fetch(`/u/${{UID}}/api/p/${{PNAME}}/refresh`, {{method:'POST', signal: ctrl.signal}});
+    const res  = await fetch(`/api/p/${{PNAME}}/refresh`, {{method:'POST', signal: ctrl.signal}});
     clearTimeout(tid);
     if (res.ok) {{ location.reload(); }}
     else {{ const e = await res.json(); alert('가격 조회 오류: ' + e.error); }}
@@ -1774,14 +1602,14 @@ function closeNewPortfolioModal() {{
 async function createPortfolio() {{
   const name = document.getElementById('new-ptab-name').value.trim();
   if (!name) {{ alert('이름을 입력하세요'); return; }}
-  const res = await fetch('/u/' + UID + '/api/portfolios', {{
+  const res = await fetch('/api/portfolios', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{ name }}),
   }});
   if (res.ok) {{
     const d = await res.json();
-    location.href = '/u/' + UID + '/p/' + d.pname;
+    location.href = '/p/' + d.pname;
   }} else {{
     const e = await res.json(); alert('오류: ' + e.error);
   }}
@@ -1799,7 +1627,7 @@ function closeRenameModal() {{
 async function saveRename() {{
   const name = document.getElementById('rename-ptab-name').value.trim();
   if (!name) {{ alert('이름을 입력하세요'); return; }}
-  const res = await fetch('/u/' + UID + '/api/portfolios/' + _renamePname, {{
+  const res = await fetch('/api/portfolios/' + _renamePname, {{
     method: 'PATCH',
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{ name }}),
@@ -1810,7 +1638,7 @@ async function saveRename() {{
 
 async function deletePortfolio(pname) {{
   if (!confirm('이 포트폴리오를 삭제할까요?\\n모든 데이터(종목, 자금기록, 히스토리)가 삭제됩니다.')) return;
-  const res = await fetch('/u/' + UID + '/api/portfolios/' + pname, {{ method: 'DELETE' }});
+  const res = await fetch('/api/portfolios/' + pname, {{ method: 'DELETE' }});
   if (res.ok) {{
     const d = await res.json();
     location.href = d.redirect;
@@ -1848,7 +1676,7 @@ async function saveCashflow() {{
     return;
   }}
   try {{
-    const res = await fetch(`/u/${{UID}}/api/cashflow/${{PNAME}}`, {{
+    const res = await fetch(`/api/cashflow/${{PNAME}}`, {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{ type, amount, memo }}),
@@ -1962,22 +1790,6 @@ def build_html(df: pd.DataFrame) -> str:
 # =======================================================
 # bot.py
 # =======================================================
-"""
-bot.py  ─  포트폴리오 대시보드 텔레그램 봇 (멀티 포트폴리오)
-────────────────────────────────────────────────────
-명령어
-  /portfolio  포트폴리오 목록 + URL
-  /refresh    활성 포트폴리오 가격 재조회
-  /summary    활성 포트폴리오 텍스트 요약
-  /run        대시보드 URL
-  /help       사용법
-
-자동 스케줄 (KST)
-  15:35  KR 장 마감
-  07:00  US 장 마감
-────────────────────────────────────────────────────
-"""
-
 import os
 import sys
 import asyncio
@@ -1994,7 +1806,6 @@ load_dotenv()
 import pandas as pd
 import pytz
 from flask import Flask, abort, jsonify, redirect, request
-from pyngrok import ngrok, conf as ngrok_conf
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update, Bot
 from telegram.ext import (
@@ -2003,15 +1814,16 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+    load_portfolios, save_portfolios,
+    create_portfolio, rename_portfolio, delete_portfolio,
+    save_snapshot, load_cashflow, add_cashflow,
+)
+
 # ══════════════════════════════════════════
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "여기에_텔레그램_토큰_입력")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 NGROK_TOKEN      = os.getenv("NGROK_TOKEN",       "여기에_ngrok_토큰_입력")
-FLASK_PORT       = int(os.getenv("FLASK_PORT",    "5050"))
-# USE_NGROK=false → ngrok 없이 Flask 직접 노출 (GCP 등 공인 IP 서버에서 사용)
-# FLASK_PUBLIC_URL → 외부에서 접근 가능한 URL (예: http://34.xx.xx.xx:5050)
-USE_NGROK        = os.getenv("USE_NGROK", "true").lower() not in ("false", "0", "no")
-FLASK_PUBLIC_URL = os.getenv("FLASK_PUBLIC_URL", "")
+FLASK_PORT       = 5050
 KST              = pytz.timezone("Asia/Seoul")
 # ══════════════════════════════════════════
 
@@ -2022,35 +1834,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── 전역 상태 ──
-# all_users[uid] = { "portfolios": {...}, "active_pname": "" }
-all_users:   dict = {}
-_users_lock: threading.Lock = threading.Lock()
-public_url:  str  = ""
-tg_bot: "Bot | None" = None
+# portfolios[pname] = { "name", "last_update", "df" }
+portfolios:   dict = {}
+active_pname: str  = ""
+public_url:   str  = ""
+
+# ── 대시보드 빌드 중복 방지 ──
+_build_lock  = threading.Lock()   # _building / _hist_check 접근용
+_building:   set  = set()         # 현재 빌드 중인 pname
+_hist_check: dict = {}            # pname -> "YYYY-MM-DD" (오늘 이미 완료)
 
 app_flask    = Flask(__name__)
 REQUIRED_COLS = {"종목명", "국가", "평단가", "수량", "통화"}
 
 
-def _get_user_state(uid: int) -> dict:
-    with _users_lock:
-        if uid in all_users:
-            return all_users[uid]
-    # 락 밖에서 디스크 I/O (블로킹 최소화)
-    portfolios, active_pname = load_portfolios(uid)
-    state = {"portfolios": portfolios, "active_pname": active_pname}
-    with _users_lock:
-        # 다른 스레드가 먼저 등록했을 수 있으므로 재확인
-        if uid not in all_users:
-            all_users[uid] = state
-        return all_users[uid]
-
-
-def _check_token(uid: int):
-    """요청의 ?t= 토큰이 유효하지 않으면 403 반환"""
-    token = request.args.get("t", "")
-    if not _secrets.compare_digest(token, get_user_token(uid)):
-        abort(403)
+def _is_owner(update: Update) -> bool:
+    return update.effective_user.id == TELEGRAM_CHAT_ID
 
 
 @app_flask.after_request
@@ -2064,61 +1863,40 @@ def skip_ngrok_warning(response):
 # ────────────────────────────────────────
 @app_flask.route("/")
 def index():
-    # 기본 사용자(TELEGRAM_CHAT_ID)의 포트폴리오로 리다이렉트
-    uid   = TELEGRAM_CHAT_ID
-    token = get_user_token(uid)
-    state = _get_user_state(uid)
-    portfolios   = state["portfolios"]
-    active_pname = state["active_pname"]
     if active_pname and active_pname in portfolios:
-        return redirect(f"/u/{uid}/p/{active_pname}?t={token}")
+        return redirect(f"/p/{active_pname}")
     if portfolios:
-        return redirect(f"/u/{uid}/p/{next(iter(portfolios))}?t={token}")
+        return redirect(f"/p/{next(iter(portfolios))}")
     return "<p>포트폴리오 없음</p>", 404
 
 
-@app_flask.route("/u/<int:uid>/p/<pname>")
-def portfolio_page(uid: int, pname: str):
-    _check_token(uid)
-    state = _get_user_state(uid)
-    portfolios   = state["portfolios"]
+@app_flask.route("/p/<pname>")
+def portfolio_page(pname: str):
+    global active_pname
     if pname not in portfolios:
         abort(404)
-    state["active_pname"] = pname
-    save_portfolios(uid, portfolios, pname)
-    p  = portfolios[pname]
-    df = p["df"]
-    # 오늘 스냅샷이 없으면 백그라운드에서 가격 조회 (Flask 스레드 블로킹 방지)
-    if df is not None and len(df) > 0:
-        from datetime import date as _date
-        today = _date.today().isoformat()
-        hist_check = load_history(uid, pname)
-        if today not in hist_check:
-            threading.Thread(
-                target=build_dashboard_for, args=(uid, pname), daemon=True
-            ).start()
+    active_pname = pname
+    save_portfolios(portfolios, active_pname)
+    p = portfolios[pname]
+    if p.get("df") is not None and len(p["df"]) > 0:
+        _trigger_build_if_needed(pname)
     return build_user_html(
-        portfolios[pname]["df"],
+        p["df"],
         display_name=p.get("name", "포트폴리오"),
-        cashflows=load_cashflow(uid, pname),
+        cashflows=load_cashflow(pname),
         pname=pname,
         all_portfolios=portfolios,
-        uid=uid,
-        token=get_user_token(uid),
     )
 
 
 # ── 포트폴리오 관리 ──
-@app_flask.route("/u/<int:uid>/api/portfolios", methods=["POST"])
-def api_create_portfolio(uid: int):
-    _check_token(uid)
-    state = _get_user_state(uid)
-    portfolios = state["portfolios"]
+@app_flask.route("/api/portfolios", methods=["POST"])
+def api_create_portfolio():
     data = request.get_json()
     name = str(data.get("name", "")).strip()
     if not name:
         return jsonify({"error": "이름을 입력하세요"}), 400
-    pname = create_portfolio(uid, name)
+    pname = create_portfolio(name)
     portfolios[pname] = {
         "name":        name,
         "last_update": None,
@@ -2127,11 +1905,8 @@ def api_create_portfolio(uid: int):
     return jsonify({"ok": True, "pname": pname})
 
 
-@app_flask.route("/u/<int:uid>/api/portfolios/<pname>", methods=["PATCH"])
-def api_rename_portfolio(uid: int, pname: str):
-    _check_token(uid)
-    state = _get_user_state(uid)
-    portfolios = state["portfolios"]
+@app_flask.route("/api/portfolios/<pname>", methods=["PATCH"])
+def api_rename_portfolio(pname: str):
     if pname not in portfolios:
         return jsonify({"error": "포트폴리오 없음"}), 404
     data = request.get_json()
@@ -2139,34 +1914,28 @@ def api_rename_portfolio(uid: int, pname: str):
     if not name:
         return jsonify({"error": "이름을 입력하세요"}), 400
     portfolios[pname]["name"] = name
-    rename_portfolio(uid, pname, name)
+    rename_portfolio(pname, name)
     return jsonify({"ok": True})
 
 
-@app_flask.route("/u/<int:uid>/api/portfolios/<pname>", methods=["DELETE"])
-def api_delete_portfolio(uid: int, pname: str):
-    _check_token(uid)
-    state = _get_user_state(uid)
-    portfolios = state["portfolios"]
+@app_flask.route("/api/portfolios/<pname>", methods=["DELETE"])
+def api_delete_portfolio(pname: str):
+    global active_pname
     if pname not in portfolios:
         return jsonify({"error": "포트폴리오 없음"}), 404
     if len(portfolios) <= 1:
         return jsonify({"error": "마지막 포트폴리오는 삭제할 수 없습니다"}), 400
     del portfolios[pname]
-    new_active = delete_portfolio(uid, pname)
+    new_active = delete_portfolio(pname)
     if not new_active or new_active not in portfolios:
         new_active = next(iter(portfolios))
-    state["active_pname"] = new_active
-    token = get_user_token(uid)
-    return jsonify({"ok": True, "redirect": f"/u/{uid}/p/{new_active}?t={token}"})
+    active_pname = new_active
+    return jsonify({"ok": True, "redirect": f"/p/{new_active}"})
 
 
 # ── 종목 추가/수정 ──
-@app_flask.route("/u/<int:uid>/api/p/<pname>/stock", methods=["POST"])
-def api_add_stock(uid: int, pname: str):
-    _check_token(uid)
-    state = _get_user_state(uid)
-    portfolios = state["portfolios"]
+@app_flask.route("/api/p/<pname>/stock", methods=["POST"])
+def api_add_stock(pname: str):
     if pname not in portfolios:
         portfolios[pname] = {
             "name": pname, "last_update": None,
@@ -2195,56 +1964,48 @@ def api_add_stock(uid: int, pname: str):
 
         drop_cols = [c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in df.columns]
         portfolios[pname]["df"] = df.drop(columns=drop_cols)
-        save_portfolios(uid, portfolios, state["active_pname"])
+        save_portfolios(portfolios, active_pname)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
 # ── 종목 삭제 ──
-@app_flask.route("/u/<int:uid>/api/p/<pname>/stock/<path:name>", methods=["DELETE"])
-def api_del_stock(uid: int, pname: str, name: str):
-    _check_token(uid)
-    state = _get_user_state(uid)
-    portfolios = state["portfolios"]
+@app_flask.route("/api/p/<pname>/stock/<path:name>", methods=["DELETE"])
+def api_del_stock(pname: str, name: str):
     if pname not in portfolios:
         return jsonify({"error": "포트폴리오 없음"}), 404
     df = portfolios[pname]["df"]
     if name not in df["종목명"].values:
         return jsonify({"error": "종목 없음"}), 404
     portfolios[pname]["df"] = df[df["종목명"] != name].reset_index(drop=True)
-    save_portfolios(uid, portfolios, state["active_pname"])
+    save_portfolios(portfolios, active_pname)
     return jsonify({"ok": True})
 
 
 # ── 가격 재조회 ──
-@app_flask.route("/u/<int:uid>/api/p/<pname>/refresh", methods=["POST"])
-def api_refresh(uid: int, pname: str):
-    _check_token(uid)
-    state = _get_user_state(uid)
-    portfolios = state["portfolios"]
+@app_flask.route("/api/p/<pname>/refresh", methods=["POST"])
+def api_refresh(pname: str):
     if pname not in portfolios:
         return jsonify({"error": "포트폴리오 없음"}), 404
     df = portfolios[pname].get("df")
     if df is None or len(df) == 0:
         return jsonify({"error": "종목을 먼저 추가해 주세요"}), 400
     try:
-        build_dashboard_for(uid, pname)
+        build_dashboard_for(pname)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 # ── 자금 기록 ──
-@app_flask.route("/u/<int:uid>/api/cashflow/<pname>", methods=["GET"])
-def api_get_cashflow(uid: int, pname: str):
-    _check_token(uid)
-    return jsonify(load_cashflow(uid, pname))
+@app_flask.route("/api/cashflow/<pname>", methods=["GET"])
+def api_get_cashflow(pname: str):
+    return jsonify(load_cashflow(pname))
 
 
-@app_flask.route("/u/<int:uid>/api/cashflow/<pname>", methods=["POST"])
-def api_add_cashflow_route(uid: int, pname: str):
-    _check_token(uid)
+@app_flask.route("/api/cashflow/<pname>", methods=["POST"])
+def api_add_cashflow_route(pname: str):
     data = request.get_json()
     try:
         type_  = str(data["type"]).strip()
@@ -2254,52 +2015,10 @@ def api_add_cashflow_route(uid: int, pname: str):
             return jsonify({"error": "type은 'in' 또는 'out'이어야 합니다"}), 400
         if amount <= 0:
             return jsonify({"error": "금액은 0보다 커야 합니다"}), 400
-        add_cashflow(uid, pname, type_, amount, memo)
+        add_cashflow(pname, type_, amount, memo)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-
-
-@app_flask.route("/u/<int:uid>/api/index_returns")
-def api_index_returns(uid: int):
-    _check_token(uid)
-    from flask import request as freq
-    import yfinance as yf
-
-    start = freq.args.get("start", "")
-    if not start:
-        return jsonify({})
-
-    tickers = {
-        "KOSPI":  "^KS11",
-        "KOSDAQ": "^KQ11",
-        "NASDAQ": "^IXIC",
-        "S&P500": "^GSPC",
-    }
-
-    result = {}
-    for name, ticker in tickers.items():
-        try:
-            df_idx = yf.download(ticker, start=start, progress=False, auto_adjust=True)
-            if df_idx.empty:
-                result[name] = []
-                continue
-            closes = df_idx["Close"]
-            if hasattr(closes, "squeeze"):
-                closes = closes.squeeze()
-            closes = closes.dropna()
-            base   = float(closes.iloc[0])
-            result[name] = [
-                {
-                    "date":   str(d.date()),
-                    "return": round((float(v) - base) / base * 100, 4),
-                }
-                for d, v in closes.items()
-            ]
-        except Exception:
-            result[name] = []
-
-    return jsonify(result)
 
 
 def run_flask():
@@ -2326,6 +2045,7 @@ def _find_existing_tunnel() -> str:
 
 def start_ngrok() -> str:
     import time
+    from pyngrok import ngrok, conf as ngrok_conf
     from pyngrok.exception import PyngrokNgrokHTTPError, PyngrokNgrokError
     global public_url
 
@@ -2338,20 +2058,12 @@ def start_ngrok() -> str:
     ngrok_conf.get_default().auth_token = NGROK_TOKEN
     for attempt in range(10):
         try:
-            tunnel     = ngrok.connect(FLASK_PORT, "http")
+            tunnel    = ngrok.connect(FLASK_PORT, "http")
             public_url = tunnel.public_url.replace("http://", "https://")
-            log.info(f"ngrok URL: {public_url}")
+            log.info(f"🌐 ngrok URL: {public_url}")
             return public_url
         except (PyngrokNgrokHTTPError, PyngrokNgrokError) as e:
-            err = str(e)
-            if "ERR_NGROK_334" in err or "already online" in err:
-                log.info(f"ngrok 기존 세션 감지 — kill 후 재시도 ({attempt+1}/10)")
-                try:
-                    ngrok.kill()
-                except Exception:
-                    pass
-                time.sleep(15)
-            elif "ERR_NGROK_108" in err and attempt < 9:
+            if ("already online" in str(e) or "ERR_NGROK_108" in str(e)) and attempt < 9:
                 log.info(f"ngrok 세션 해제 대기 중... (20초, {attempt+1}/10)")
                 time.sleep(20)
             else:
@@ -2362,33 +2074,49 @@ def start_ngrok() -> str:
 # ────────────────────────────────────────
 # 가격 조회
 # ────────────────────────────────────────
-def build_dashboard_for(uid: int, pname: str) -> pd.DataFrame:
-    state      = _get_user_state(uid)
-    portfolios = state["portfolios"]
-    p          = portfolios[pname]
-    df_raw     = p["df"].drop(
+def build_dashboard_for(pname: str) -> pd.DataFrame:
+    p      = portfolios[pname]
+    df_raw = p["df"].drop(
         columns=[c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in p["df"].columns]
     )
     df = fetch_prices(df_raw)
     portfolios[pname]["df"]          = df
     portfolios[pname]["last_update"] = datetime.now(KST)
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
-    save_snapshot(uid, pname, df, usd_krw)
-    save_portfolios(uid, portfolios, state["active_pname"])
+    save_snapshot(pname, df, usd_krw)
+    save_portfolios(portfolios, active_pname)
     return df
+
+
+def _build_dashboard_bg(pname: str) -> None:
+    """백그라운드 스레드용 wrapper — 완료 후 _building에서 제거."""
+    try:
+        build_dashboard_for(pname)
+    finally:
+        with _build_lock:
+            _building.discard(pname)
+
+
+def _trigger_build_if_needed(pname: str) -> None:
+    """오늘 아직 빌드하지 않았고, 현재 빌드 중이 아닐 때만 스레드 1개 생성."""
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    with _build_lock:
+        if _hist_check.get(pname) == today or pname in _building:
+            return
+        _building.add(pname)
+        _hist_check[pname] = today  # 스레드 시작 전에 기록 (중복 방지)
+    threading.Thread(target=_build_dashboard_bg, args=(pname,), daemon=True).start()
 
 
 # ────────────────────────────────────────
 # 텍스트 요약
 # ────────────────────────────────────────
-def _summary_text(uid: int, pname: str) -> str:
-    state = _get_user_state(uid)
-    p     = state["portfolios"][pname]
-    df    = p["df"]
-    ts    = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
-    name  = p.get("name", "포트폴리오")
-    token = get_user_token(uid)
-    url   = f"{public_url}/u/{uid}/p/{pname}?t={token}"
+def _summary_text(pname: str) -> str:
+    p    = portfolios[pname]
+    df   = p["df"]
+    ts   = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
+    name = p.get("name", "포트폴리오")
+    url  = f"{public_url}/p/{pname}"
 
     lines = [f"📊 *{name} 요약* `{ts} KST`\n"]
     valid = df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
@@ -2413,6 +2141,8 @@ def _summary_text(uid: int, pname: str) -> str:
 # 커맨드 핸들러
 # ────────────────────────────────────────
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
     await update.message.reply_text(
         "📋 *사용법*\n\n"
         "명령어\n"
@@ -2427,11 +2157,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    state = _get_user_state(uid)
-    active_pname = state["active_pname"]
-    token = get_user_token(uid)
-    url = f"{public_url}/u/{uid}/p/{active_pname}?t={token}" if active_pname else public_url
+    if not _is_owner(update):
+        return
+    url = f"{public_url}/p/{active_pname}" if active_pname else public_url
     await update.message.reply_text(
         f"📊 *대시보드 URL*\n\n🔗 {url}",
         parse_mode=ParseMode.MARKDOWN,
@@ -2440,20 +2168,17 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    state = _get_user_state(uid)
-    portfolios   = state["portfolios"]
-    active_pname = state["active_pname"]
+    if not _is_owner(update):
+        return
     if not portfolios:
         await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
         return
-    token = get_user_token(uid)
     lines = ["📁 *포트폴리오 목록*\n"]
     for pname, p in portfolios.items():
         name = p.get("name", pname)
         ts   = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
         mark = "▶ " if pname == active_pname else "   "
-        url  = f"{public_url}/u/{uid}/p/{pname}?t={token}"
+        url  = f"{public_url}/p/{pname}"
         lines.append(f"{mark}*{name}* `{ts}`\n🔗 {url}")
     await update.message.reply_text(
         "\n\n".join(lines),
@@ -2463,19 +2188,16 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    state = _get_user_state(uid)
-    portfolios   = state["portfolios"]
-    active_pname = state["active_pname"]
+    if not _is_owner(update):
+        return
     if active_pname not in portfolios:
         await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
         return
     msg = await update.message.reply_text("🔄 가격 재조회 중...")
     try:
-        await asyncio.get_running_loop().run_in_executor(None, build_dashboard_for, uid, active_pname)
-        ts    = portfolios[active_pname]["last_update"].strftime("%m/%d %H:%M")
-        token = get_user_token(uid)
-        url   = f"{public_url}/u/{uid}/p/{active_pname}?t={token}"
+        await asyncio.get_running_loop().run_in_executor(None, build_dashboard_for, active_pname)
+        ts  = portfolios[active_pname]["last_update"].strftime("%m/%d %H:%M")
+        url = f"{public_url}/p/{active_pname}"
         await msg.edit_text(
             f"✅ *업데이트 완료*\n\n🕐 `{ts} KST`\n🔗 {url}",
             parse_mode=ParseMode.MARKDOWN,
@@ -2485,15 +2207,13 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    state = _get_user_state(uid)
-    portfolios   = state["portfolios"]
-    active_pname = state["active_pname"]
+    if not _is_owner(update):
+        return
     if active_pname not in portfolios:
         await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
         return
     await update.message.reply_text(
-        _summary_text(uid, active_pname),
+        _summary_text(active_pname),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
@@ -2503,80 +2223,64 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # 자동 스케줄
 # ────────────────────────────────────────
 async def scheduled_send(label: str):
-    if not all_users:
-        log.info(f"⏰ {label} — 사용자 없음, 건너뜀")
-        return
-    if tg_bot is None:
-        log.warning("⏰ tg_bot 미초기화, 건너뜀")
+    if not portfolios:
+        log.info(f"⏰ {label} — 포트폴리오 없음, 건너뜀")
         return
     log.info(f"⏰ 자동 전송 시작 ({label})")
-    for uid, state in list(all_users.items()):
-        portfolios = state["portfolios"]
-        for pname in list(portfolios.keys()):
-            p = portfolios[pname]
-            if p.get("df") is None or len(p.get("df", [])) == 0:
-                continue
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, build_dashboard_for, uid, pname)
-                text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(uid, pname)}"
-                await tg_bot.send_message(
-                    chat_id=uid,
-                    text=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=True,
-                )
-                log.info(f"  → uid={uid} {p.get('name')} ({pname}) 전송 완료")
-            except Exception as e:
-                log.error(f"  → uid={uid} {pname} 전송 실패: {e}")
+    bot = Bot(token=TELEGRAM_TOKEN)
+    for pname in list(portfolios.keys()):
+        p = portfolios[pname]
+        if p.get("df") is None or len(p.get("df", [])) == 0:
+            continue
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, build_dashboard_for, pname)
+            text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(pname)}"
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            log.info(f"  → {p.get('name')} ({pname}) 전송 완료")
+        except Exception as e:
+            log.error(f"  → {pname} 전송 실패: {e}")
 
 
 async def scheduled_snapshot():
-    """가격 재조회 없이 현재 df 기준으로 모든 사용자/포트폴리오 스냅샷 저장"""
-    if not all_users:
+    """가격 재조회 없이 현재 df 기준으로 모든 포트폴리오 스냅샷 저장"""
+    if not portfolios:
         return
-    for uid, state in list(all_users.items()):
-        for pname, p in list(state["portfolios"].items()):
-            df = p.get("df")
-            if df is None or len(df) == 0:
-                continue
-            try:
-                usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns else 1370.0
-                save_snapshot(uid, pname, df, usd_krw)
-                log.info(f"  📸 자정 스냅샷 저장: uid={uid} {p.get('name', pname)}")
-            except Exception as e:
-                log.error(f"  ⚠️  자정 스냅샷 실패 (uid={uid} {pname}): {e}")
+    for pname, p in list(portfolios.items()):
+        df = p.get("df")
+        if df is None or len(df) == 0:
+            continue
+        try:
+            usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns else 1370.0
+            save_snapshot(pname, df, usd_krw)
+            log.info(f"  📸 자정 스냅샷 저장: {p.get('name', pname)}")
+        except Exception as e:
+            log.error(f"  ⚠️  자정 스냅샷 실패 ({pname}): {e}")
 
 
 # ────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────
 def main():
-    global all_users
+    global portfolios, active_pname
 
     log.info("=" * 55)
-    log.info("  📊  포트폴리오 봇 시작 (멀티유저)")
+    log.info("  📊  포트폴리오 봇 시작 (멀티 포트폴리오)")
     log.info("=" * 55)
 
-    # 기본 사용자(TELEGRAM_CHAT_ID) 데이터 로드
-    portfolios, active_pname = load_portfolios(TELEGRAM_CHAT_ID)
-    all_users[TELEGRAM_CHAT_ID] = {"portfolios": portfolios, "active_pname": active_pname}
-    log.info(f"  📁 포트폴리오 {len(portfolios)}개 로드 (uid={TELEGRAM_CHAT_ID}), 활성: {active_pname}")
+    portfolios, active_pname = load_portfolios()
+    log.info(f"  📁 포트폴리오 {len(portfolios)}개 로드, 활성: {active_pname}")
 
     threading.Thread(target=run_flask, daemon=True).start()
     log.info(f"  🖥️  Flask 서버 시작 (port {FLASK_PORT})")
 
-    if USE_NGROK:
-        start_ngrok()
-    elif FLASK_PUBLIC_URL:
-        global public_url
-        public_url = FLASK_PUBLIC_URL.rstrip("/")
-        log.info(f"  🌐 공인 IP 모드: {public_url}")
-    else:
-        log.warning("  ⚠️  USE_NGROK=false이지만 FLASK_PUBLIC_URL 미설정 — 대시보드 링크가 비어 있습니다")
+    start_ngrok()
 
-    global tg_bot
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
-    tg_bot = tg_app.bot
     tg_app.add_handler(CommandHandler("start",     cmd_help))
     tg_app.add_handler(CommandHandler("help",      cmd_help))
     tg_app.add_handler(CommandHandler("run",       cmd_run))
