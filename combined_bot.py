@@ -1600,9 +1600,13 @@ try {{
     }},
   }});
 
-  {hist_chart_js}
 }} catch(e) {{
   console.error("Chart 초기화 오류:", e);
+}}
+try {{
+  {hist_chart_js}
+}} catch(e) {{
+  console.error("histChart 초기화 오류:", e);
 }}
 </script>
 </body>
