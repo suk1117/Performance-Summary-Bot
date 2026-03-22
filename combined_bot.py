@@ -88,12 +88,20 @@ def _migrate(uid: int):
     if os.path.exists(old_portfolios):
         try:
             shutil.copy2(old_portfolios, dst)
+            migrated = [old_portfolios]
             for fname in os.listdir(DATA_DIR):
                 if fname.startswith("history_") or fname.startswith("cashflow_"):
                     src = os.path.join(DATA_DIR, fname)
                     d   = os.path.join(_user_dir(uid), fname)
                     if not os.path.exists(d):
                         shutil.copy2(src, d)
+                    migrated.append(src)
+            # 마이그레이션 완료 후 구버전 파일 삭제 (다른 유저에게 복사되지 않도록)
+            for f in migrated:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
             print(f"✅ 기존 데이터 → data/user_{uid}/ 마이그레이션 완료")
         except Exception as e:
             print(f"⚠️  마이그레이션 오류: {e}")
@@ -118,6 +126,7 @@ def _migrate(uid: int):
             },
         }
         _save_raw(uid, raw)
+        migrated = [old_file]
         for old_name, new_name in [
             ("cashflow.json", f"cashflow_{pname}.json"),
             ("history.json",  f"history_{pname}.json"),
@@ -126,6 +135,13 @@ def _migrate(uid: int):
             d   = os.path.join(_user_dir(uid), new_name)
             if os.path.exists(src) and not os.path.exists(d):
                 shutil.copy2(src, d)
+                migrated.append(src)
+        # 마이그레이션 완료 후 구버전 파일 삭제
+        for f in migrated:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
         print(f"✅ portfolio.json → data/user_{uid}/ 마이그레이션 완료")
     except Exception as e:
         print(f"⚠️  마이그레이션 오류: {e}")
@@ -649,22 +665,19 @@ def build_user_html(
             df = df.copy()
             df[col] = float("nan")
 
-    valid = df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
-    total_return = (
-        (valid["비중(%)"] * valid["수익률(%)"]).sum() / valid["비중(%)"].sum()
-        if not valid.empty else 0.0
-    )
-
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
 
     stock_eval_krw = 0.0
+    total_buy      = 0.0
     for _, _r in df.iterrows():
         _mult  = usd_krw if str(_r["통화"]).upper() == "USD" else 1.0
         _qty   = float(_r["수량"]) if "수량" in _r.index and pd.notna(_r.get("수량")) else 0.0
         _cur   = _r.get("현재가")
         _price = float(_cur) if pd.notna(_cur) else float(_r["평단가"])
         stock_eval_krw += _price * _qty * _mult
-    cash_krw    = max(0.0, net_investment - stock_eval_krw) if net_investment > 0 else 0.0
+        total_buy      += float(_r["평단가"]) * _qty * _mult
+    total_return = (stock_eval_krw - total_buy) / total_buy * 100 if total_buy > 0 else 0.0
+    cash_krw    = max(0.0, net_investment - total_buy) if net_investment > 0 else 0.0
     total_ev    = stock_eval_krw + cash_krw
     show_cash   = net_investment > 0 and cash_krw > 0
     _w_scale    = stock_eval_krw / total_ev if total_ev > 0 else 1.0
@@ -721,7 +734,7 @@ def build_user_html(
     ret_count    = len(ret_df)
     ret_chart_h  = max(160, ret_count * 56)
 
-    total_buy = total_eval = 0.0
+    total_eval = 0.0
     name_to_color = {name: PALETTE[i % len(PALETTE)] for i, name in enumerate(df["종목명"].tolist())}
     table_rows = ""
 
@@ -763,7 +776,6 @@ def build_user_html(
 
         if qty is not None:
             buy_krw  = avg * qty * multiplier
-            total_buy += buy_krw
             buy_str  = f"₩{buy_krw:,.0f}" if currency == "KRW" else f"${avg*qty:,.2f}"
             if pd.notna(cur_price):
                 eval_krw   = float(cur_price) * qty * multiplier
@@ -802,16 +814,16 @@ def build_user_html(
           <td class="num" style="color:#0f172a;font-weight:600">{cur_str}</td>
           <td class="num" style="color:{chg_col};font-weight:700">{chg_str}</td>
           <td class="num" style="color:{ret_col};font-weight:600">{ret_str}</td>
-          <td class="num">{weight:.1f}%</td>
+          <td class="num">{weight * _w_scale:.1f}%</td>
           <td class="num">{buy_str}</td>
           <td class="num">{eval_str}</td>
           {edit_btns}
         </tr>"""
 
-    total_eval   += cash_krw
-    total_pnl     = total_eval - total_buy
+    total_pnl     = stock_eval_krw - total_buy
     total_pnl_pct = (total_pnl / total_buy * 100) if total_buy > 0 else 0.0
-    cash_weight   = round(cash_krw / total_eval * 100, 1) if total_eval > 0 else 0.0
+    total_eval   += cash_krw
+    cash_weight   = round(cash_krw / total_ev * 100, 1) if total_ev > 0 else 0.0
     stock_count   = len(df)
 
     daily_pnl = 0.0
@@ -825,7 +837,7 @@ def build_user_html(
         mult     = usd_krw if currency == "USD" else 1.0
         prev_price   = float(cp) / (1 + float(chg) / 100)
         daily_pnl   += (float(cp) - prev_price) * qty * mult
-    daily_pnl_pct  = (daily_pnl / total_eval * 100) if total_eval > 0 else 0.0
+    daily_pnl_pct = (daily_pnl / stock_eval_krw * 100) if stock_eval_krw > 0 else 0.0
 
     def fmt_krw(v: float) -> str:
         if abs(v) >= 1e8:
@@ -843,7 +855,7 @@ def build_user_html(
             f'<td class="num">—</td>'
             f'<td class="num">—</td>'
             f'<td class="num">{cash_weight:.1f}%</td>'
-            f'<td class="num">{fmt_krw(net_investment)}</td>'
+            f'<td class="num">—</td>'
             f'<td class="num">{fmt_krw(cash_krw)}</td>'
             f'<td></td>'
             f'</tr>'
@@ -922,7 +934,7 @@ def build_user_html(
         hist_chart_html = ""
         hist_chart_js   = ""
 
-    eval_disp      = fmt_krw(total_eval)
+    eval_disp      = fmt_krw(total_ev)
     pnl_disp       = fmt_krw(total_pnl)
     pnl_sign       = "+" if total_pnl >= 0 else ""
     pnl_color      = "#16a34a" if total_pnl >= 0 else "#dc2626"
@@ -1930,9 +1942,14 @@ def _summary_text(uid: int, pname: str) -> str:
     url   = f"{public_url}/u/{uid}/p/{pname}?t={token}"
 
     lines = [f"📊 *{name} 요약* `{ts} KST`\n"]
+    usd_krw_s = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
     valid = df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
     if not valid.empty:
-        total = (valid["비중(%)"] * valid["수익률(%)"]).sum() / valid["비중(%)"].sum()
+        buy_w = valid.apply(
+            lambda r: float(r["평단가"]) * (float(r["수량"]) if pd.notna(r.get("수량")) else 0.0)
+                      * (usd_krw_s if str(r.get("통화", "KRW")).upper() == "USD" else 1.0), axis=1
+        )
+        total = (valid["수익률(%)"] * buy_w).sum() / buy_w.sum() if buy_w.sum() > 0 else 0.0
         emoji = "🟢" if total >= 0 else "🔴"
         lines.append(f"{emoji} *가중 평균 수익률: {'+' if total>=0 else ''}{total:.2f}%*\n")
 
