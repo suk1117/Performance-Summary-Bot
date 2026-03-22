@@ -1087,7 +1087,7 @@ window.toggleIndex = async function(name) {{
   // 캐시 없으면 API 조회
   if (!_idxCache[name] && _histStart) {{
     try {{
-      const r = await fetch(`/u/${UID}/api/index_returns?start=${_histStart}&t=${TOKEN}`);
+      const r = await fetch(`/u/${{UID}}/api/index_returns?start=${{_histStart}}&t=${{TOKEN}}`);
       const all = await r.json();
       Object.keys(all).forEach(k => {{ _idxCache[k] = all[k]; }});
     }} catch(e) {{
