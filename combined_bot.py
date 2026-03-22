@@ -1849,7 +1849,7 @@ def api_add_cashflow_route(uid: int, pname: str):
 
 
 def run_flask():
-    app_flask.run(port=FLASK_PORT, use_reloader=False)
+    app_flask.run(host="0.0.0.0", port=FLASK_PORT, use_reloader=False)
 
 
 # ────────────────────────────────────────
@@ -1986,7 +1986,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  `/summary`   — 텍스트 요약\n\n"
         "자동 알림\n"
         "  🇰🇷 KST 15:35 / 🇺🇸 KST 07:00",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=None,
     )
 
 
@@ -1998,7 +1998,7 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     url = f"{public_url}/u/{uid}/p/{active}?t={token}" if active else public_url
     await update.message.reply_text(
         f"📊 *대시보드 URL*\n\n🔗 {url}",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=None,
         disable_web_page_preview=True,
     )
 
@@ -2021,7 +2021,7 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{mark}*{name}* `{ts}`\n🔗 {url}")
     await update.message.reply_text(
         "\n\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=None,
         disable_web_page_preview=True,
     )
 
@@ -2041,7 +2041,7 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         url   = f"{public_url}/u/{uid}/p/{active_pname}?t={token}"
         await msg.edit_text(
             f"✅ *업데이트 완료*\n\n🕐 `{ts} KST`\n🔗 {url}",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=None,
         )
     except Exception as e:
         await msg.edit_text(f"❌ 오류: {e}")
@@ -2056,7 +2056,7 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         _summary_text(uid, active_pname),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=None,
         disable_web_page_preview=True,
     )
 
@@ -2082,7 +2082,7 @@ async def scheduled_send(label: str):
                 await tg_bot.send_message(
                     chat_id=uid,
                     text=text,
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=None,
                     disable_web_page_preview=True,
                 )
                 log.info(f"  → uid={uid} {p.get('name')} ({pname}) 전송 완료")
