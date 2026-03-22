@@ -1,5 +1,5 @@
 """
-combined_bot.py - 전체 포트폴리오 봇 (단일 파일)
+combined_bot.py - 전체 포트폴리오 봇 (단일 파일) - 멀티유저
 storage + price_fetcher + html_builder + bot 통합
 """
 from __future__ import annotations
@@ -9,41 +9,51 @@ from __future__ import annotations
 # =======================================================
 import json
 import os
+import secrets as _secrets
 from datetime import datetime, date
 import pandas as pd
 
-DATA_DIR        = os.path.join(os.path.dirname(__file__), "data")
-PORTFOLIOS_FILE = os.path.join(DATA_DIR, "portfolios.json")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 _NUMERIC_COLS = ["비중(%)", "평단가", "수량", "현재가", "수익률(%)", "등락률(%)", "USD_KRW"]
 _EMPTY_COLS   = ["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]
 
 
-# ─── 내부 헬퍼 ───────────────────────────────────────
+# ─── 내부 헬퍼 ────────────────────────────────────────
 def _safe_pname(pname: str) -> str:
     import re
     if not re.fullmatch(r"[A-Za-z0-9_-]+", pname):
         raise ValueError(f"잘못된 포트폴리오 ID: {pname!r}")
     return pname
 
-def _history_path(pname: str) -> str:
-    return os.path.join(DATA_DIR, f"history_{_safe_pname(pname)}.json")
+def _user_dir(uid: int) -> str:
+    """data/user_{uid}/ 생성 후 경로 반환"""
+    path = os.path.join(DATA_DIR, f"user_{uid}")
+    os.makedirs(path, exist_ok=True)
+    return path
 
-def _cashflow_path(pname: str) -> str:
-    return os.path.join(DATA_DIR, f"cashflow_{_safe_pname(pname)}.json")
+def _portfolios_file(uid: int) -> str:
+    return os.path.join(_user_dir(uid), "portfolios.json")
 
-def _raw() -> dict:
-    if not os.path.exists(PORTFOLIOS_FILE):
+def _history_path(uid: int, pname: str) -> str:
+    return os.path.join(_user_dir(uid), f"history_{_safe_pname(pname)}.json")
+
+def _cashflow_path(uid: int, pname: str) -> str:
+    return os.path.join(_user_dir(uid), f"cashflow_{_safe_pname(pname)}.json")
+
+def _raw(uid: int) -> dict:
+    fpath = _portfolios_file(uid)
+    if not os.path.exists(fpath):
         return {"active": "", "next_id": 1, "items": {}}
     try:
-        with open(PORTFOLIOS_FILE, "r", encoding="utf-8") as f:
+        with open(fpath, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {"active": "", "next_id": 1, "items": {}}
 
-def _save_raw(data: dict):
-    with open(PORTFOLIOS_FILE, "w", encoding="utf-8") as f:
+def _save_raw(uid: int, data: dict):
+    with open(_portfolios_file(uid), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
 
 def _df_from_records(records: list) -> pd.DataFrame:
@@ -54,10 +64,41 @@ def _df_from_records(records: list) -> pd.DataFrame:
     return df
 
 
-# ─── 구버전 단일 포트폴리오 마이그레이션 ─────────────
-def _migrate():
-    if os.path.exists(PORTFOLIOS_FILE):
+# ─── 토큰 관리 ────────────────────────────────────────
+def get_user_token(uid: int) -> str:
+    """uid별 URL 토큰 반환. 없으면 생성 후 저장."""
+    raw = _raw(uid)
+    token = raw.get("token", "")
+    if not token:
+        token = _secrets.token_urlsafe(16)
+        raw["token"] = token
+        _save_raw(uid, raw)
+    return token
+
+
+# ─── 구버전 마이그레이션 ──────────────────────────────
+def _migrate(uid: int):
+    """기존 data/portfolios.json → data/user_{uid}/portfolios.json"""
+    dst = _portfolios_file(uid)
+    if os.path.exists(dst):
         return
+    import shutil
+    # 멀티 포트폴리오 구버전
+    old_portfolios = os.path.join(DATA_DIR, "portfolios.json")
+    if os.path.exists(old_portfolios):
+        try:
+            shutil.copy2(old_portfolios, dst)
+            for fname in os.listdir(DATA_DIR):
+                if fname.startswith("history_") or fname.startswith("cashflow_"):
+                    src = os.path.join(DATA_DIR, fname)
+                    d   = os.path.join(_user_dir(uid), fname)
+                    if not os.path.exists(d):
+                        shutil.copy2(src, d)
+            print(f"✅ 기존 데이터 → data/user_{uid}/ 마이그레이션 완료")
+        except Exception as e:
+            print(f"⚠️  마이그레이션 오류: {e}")
+        return
+    # 단일 포트폴리오 구버전
     old_file = os.path.join(DATA_DIR, "portfolio.json")
     if not os.path.exists(old_file):
         return
@@ -76,26 +117,24 @@ def _migrate():
                 }
             },
         }
-        _save_raw(raw)
-        # 파일 마이그레이션
+        _save_raw(uid, raw)
         for old_name, new_name in [
-            ("cashflow.json",  f"cashflow_{pname}.json"),
-            ("history.json",   f"history_{pname}.json"),
+            ("cashflow.json", f"cashflow_{pname}.json"),
+            ("history.json",  f"history_{pname}.json"),
         ]:
             src = os.path.join(DATA_DIR, old_name)
-            dst = os.path.join(DATA_DIR, new_name)
-            if os.path.exists(src) and not os.path.exists(dst):
-                os.rename(src, dst)
-        print(f"✅ portfolio.json → portfolios.json 마이그레이션 완료")
+            d   = os.path.join(_user_dir(uid), new_name)
+            if os.path.exists(src) and not os.path.exists(d):
+                shutil.copy2(src, d)
+        print(f"✅ portfolio.json → data/user_{uid}/ 마이그레이션 완료")
     except Exception as e:
         print(f"⚠️  마이그레이션 오류: {e}")
 
 
 # ─── 포트폴리오 로드/저장 ─────────────────────────────
-def load_portfolios() -> tuple[dict, str]:
-    """(portfolios dict, active_pname) 반환. 없으면 기본 포트폴리오 생성."""
-    _migrate()
-    raw = _raw()
+def load_portfolios(uid: int) -> tuple[dict, str]:
+    _migrate(uid)
+    raw = _raw(uid)
     items = {}
     for pname, p in raw.get("items", {}).items():
         last_update = None
@@ -109,7 +148,6 @@ def load_portfolios() -> tuple[dict, str]:
             "last_update": last_update,
             "df":          _df_from_records(p.get("df", [])),
         }
-
     if not items:
         pname = "p1"
         items[pname] = {
@@ -120,18 +158,15 @@ def load_portfolios() -> tuple[dict, str]:
         raw["active"]  = pname
         raw["next_id"] = 2
         raw["items"]   = {"p1": {"name": "기본 포트폴리오", "last_update": None, "df": []}}
-        _save_raw(raw)
-
+        _save_raw(uid, raw)
     active = raw.get("active", "")
     if active not in items:
         active = next(iter(items))
-
     return items, active
 
 
-def save_portfolios(portfolios: dict, active_pname: str):
-    """portfolios dict + active → JSON 저장"""
-    raw = _raw()
+def save_portfolios(uid: int, portfolios: dict, active_pname: str):
+    raw = _raw(uid)
     raw["active"] = active_pname
     out = {}
     for pname, p in portfolios.items():
@@ -141,54 +176,50 @@ def save_portfolios(portfolios: dict, active_pname: str):
             "df":          p["df"].to_dict(orient="records") if p.get("df") is not None else [],
         }
     raw["items"] = out
-    _save_raw(raw)
+    _save_raw(uid, raw)
 
 
-def create_portfolio(name: str) -> str:
-    """새 포트폴리오 생성, pname 반환"""
-    raw = _raw()
+def create_portfolio(uid: int, name: str) -> str:
+    raw = _raw(uid)
     next_id = raw.get("next_id", 1)
     pname   = f"p{next_id}"
     raw["next_id"] = next_id + 1
     if "items" not in raw:
         raw["items"] = {}
     raw["items"][pname] = {"name": name, "last_update": None, "df": []}
-    _save_raw(raw)
+    _save_raw(uid, raw)
     return pname
 
 
-def rename_portfolio(pname: str, new_name: str):
-    raw = _raw()
+def rename_portfolio(uid: int, pname: str, new_name: str):
+    raw = _raw(uid)
     if pname in raw.get("items", {}):
         raw["items"][pname]["name"] = new_name
-        _save_raw(raw)
+        _save_raw(uid, raw)
 
 
-def delete_portfolio(pname: str) -> str:
-    """포트폴리오 삭제. 새 active pname 반환."""
-    raw = _raw()
+def delete_portfolio(uid: int, pname: str) -> str:
+    raw = _raw(uid)
     items = raw.get("items", {})
     if pname in items:
         del items[pname]
     raw["items"] = items
-    # 관련 파일 삭제
-    for path in [_history_path(pname), _cashflow_path(pname)]:
+    for path in [_history_path(uid, pname), _cashflow_path(uid, pname)]:
         if os.path.exists(path):
             try:
                 os.remove(path)
             except Exception:
                 pass
-    # active 갱신
     if raw.get("active") == pname:
         remaining = list(items.keys())
         raw["active"] = remaining[0] if remaining else ""
-    _save_raw(raw)
+    _save_raw(uid, raw)
     return raw.get("active", "")
 
 
 # ─── 히스토리 스냅샷 ──────────────────────────────────
-def save_snapshot(pname: str, df: pd.DataFrame, usd_krw: float):
-    fpath   = _history_path(pname)
+def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
+    fpath   = _history_path(uid, pname)
     history = {}
     if os.path.exists(fpath):
         try:
@@ -219,7 +250,7 @@ def save_snapshot(pname: str, df: pd.DataFrame, usd_krw: float):
             "weight": float(r["비중(%)"]),
         }
 
-    net_investment   = get_net_investment(pname)
+    net_investment   = get_net_investment(uid, pname)
     cash_krw         = max(0.0, net_investment - stock_eval_krw) if net_investment > 0 else 0.0
     total_assets     = stock_eval_krw + cash_krw
     total_return_pct = (stock_eval_krw - total_buy) / total_buy * 100 if total_buy > 0 else 0.0
@@ -237,8 +268,8 @@ def save_snapshot(pname: str, df: pd.DataFrame, usd_krw: float):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-def load_history(pname: str) -> dict:
-    fpath = _history_path(pname)
+def load_history(uid: int, pname: str) -> dict:
+    fpath = _history_path(uid, pname)
     if not os.path.exists(fpath):
         return {}
     try:
@@ -249,13 +280,13 @@ def load_history(pname: str) -> dict:
 
 
 # ─── 자금 기록 ────────────────────────────────────────
-def save_cashflow(pname: str, records: list):
-    with open(_cashflow_path(pname), "w", encoding="utf-8") as f:
+def save_cashflow(uid: int, pname: str, records: list):
+    with open(_cashflow_path(uid, pname), "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
-def load_cashflow(pname: str) -> list:
-    fpath = _cashflow_path(pname)
+def load_cashflow(uid: int, pname: str) -> list:
+    fpath = _cashflow_path(uid, pname)
     if not os.path.exists(fpath):
         return []
     try:
@@ -265,19 +296,19 @@ def load_cashflow(pname: str) -> list:
         return []
 
 
-def add_cashflow(pname: str, type_: str, amount: float, memo: str):
-    records = load_cashflow(pname)
+def add_cashflow(uid: int, pname: str, type_: str, amount: float, memo: str):
+    records = load_cashflow(uid, pname)
     records.append({
         "date":   date.today().isoformat(),
         "type":   type_,
         "amount": amount,
         "memo":   memo,
     })
-    save_cashflow(pname, records)
+    save_cashflow(uid, pname, records)
 
 
-def get_net_investment(pname: str) -> float:
-    records = load_cashflow(pname)
+def get_net_investment(uid: int, pname: str) -> float:
+    records = load_cashflow(uid, pname)
     return (
         sum(r["amount"] for r in records if r["type"] == "in")
         - sum(r["amount"] for r in records if r["type"] == "out")
@@ -293,7 +324,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger(__name__)
 
-# ── 공통 헤더 ──
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -303,14 +333,10 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 
-# ── 캐시 ──
-_kr_ticker_cache: dict[str, str] = {}       # 종목명 → 티커
-_us_exchange_cache: dict[str, str] = {}     # 티커 → 거래소(NASDAQ/NYSE)
+_kr_ticker_cache: dict[str, str] = {}
+_us_exchange_cache: dict[str, str] = {}
 
 
-# ────────────────────────────────────────
-# 1. KR 종목명 → 티커 검색
-# ────────────────────────────────────────
 def _search_kr_ticker(name: str) -> str | None:
     if name in _kr_ticker_cache:
         return _kr_ticker_cache[name]
@@ -321,14 +347,12 @@ def _search_kr_ticker(name: str) -> str | None:
         r.raise_for_status()
         data = r.json()
         items = data.get("items", [])
-        # 정확히 이름이 일치하는 종목 우선
         for item in items:
             if item.get("name") == name and item.get("nationCode") == "KOR":
                 code = item["code"]
                 _kr_ticker_cache[name] = code
                 log.info(f"티커 검색: {name} → {code}")
                 return code
-        # 없으면 첫 번째 KOR 종목
         for item in items:
             if item.get("nationCode") == "KOR":
                 code = item["code"]
@@ -340,27 +364,18 @@ def _search_kr_ticker(name: str) -> str | None:
     return None
 
 
-# ────────────────────────────────────────
-# 2. 네이버 모바일 API로 현재가 조회
-# ────────────────────────────────────────
 def _naver_stock_price(code: str) -> tuple[float | None, float | None]:
-    """
-    code 예시: "005930" (KR), "AAPL:NASDAQ" (US)
-    Returns: (price, daily_change_pct)
-    """
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/basic"
         r   = requests.get(url, headers=HEADERS, timeout=5)
         r.raise_for_status()
         data = r.json()
-        # closePrice: 당일 종가 / currentPrice: 실시간
         price_str = (
             data.get("currentPrice")
             or data.get("closePrice")
             or data.get("stockEndPrice")
         )
         price = float(str(price_str).replace(",", "")) if price_str else None
-        # fluctuationsRatio: 전일 대비 등락률 (이미 float)
         change = data.get("fluctuationsRatio")
         if change is not None:
             try:
@@ -373,9 +388,6 @@ def _naver_stock_price(code: str) -> tuple[float | None, float | None]:
     return None, None
 
 
-# ────────────────────────────────────────
-# 3. KR 주식 현재가
-# ────────────────────────────────────────
 def get_kr_price(name: str) -> tuple[float | None, float | None]:
     ticker = _search_kr_ticker(name)
     if not ticker:
@@ -383,11 +395,7 @@ def get_kr_price(name: str) -> tuple[float | None, float | None]:
     return _naver_stock_price(ticker)
 
 
-# ────────────────────────────────────────
-# 4. US 주식 현재가 (네이버 금융)
-# ────────────────────────────────────────
 def get_us_price(ticker: str) -> tuple[float | None, float | None]:
-    """ticker = 'AAPL', 'TSLA' 등 심볼만 입력. Returns (price, daily_change_pct)"""
     try:
         import yfinance as yf
         t    = yf.Ticker(ticker)
@@ -406,15 +414,10 @@ def get_us_price(ticker: str) -> tuple[float | None, float | None]:
             return float(price), change
     except Exception as e:
         log.warning(f"US 가격 조회 실패 ({ticker}): {e}")
-
     return None, None
 
 
-# ────────────────────────────────────────
-# 5. USD/KRW 환율
-# ────────────────────────────────────────
 def get_usd_krw() -> float:
-    # yfinance 우선
     try:
         import yfinance as yf
         hist = yf.Ticker("USDKRW=X").history(period="5d")
@@ -422,8 +425,6 @@ def get_usd_krw() -> float:
             return float(hist["Close"].iloc[-1])
     except Exception as e:
         log.warning(f"get_usd_krw yfinance 실패: {e}")
-
-    # fallback: 네이버 금융
     try:
         url  = "https://m.stock.naver.com/api/stock/FX_USDKRW/basic"
         r    = requests.get(url, headers=HEADERS, timeout=5)
@@ -437,13 +438,9 @@ def get_usd_krw() -> float:
             return float(str(price_str).replace(",", ""))
     except Exception as e:
         log.warning(f"get_usd_krw 네이버 fallback 실패: {e}")
-
     return 1370.0
 
 
-# ────────────────────────────────────────
-# 6. 단일 종목 가격 조회 (병렬 처리용)
-# ────────────────────────────────────────
 def _fetch_one(row: dict) -> tuple[float | None, float | None]:
     name    = str(row["종목명"]).strip()
     country = str(row["국가"]).strip()
@@ -455,11 +452,7 @@ def _fetch_one(row: dict) -> tuple[float | None, float | None]:
     return None, None
 
 
-# ────────────────────────────────────────
-# 7. 전체 포트폴리오 가격 조회
-# ────────────────────────────────────────
 def fetch_prices(df: pd.DataFrame) -> pd.DataFrame:
-    # 현금 행은 build_user_html에서 자동 계산하므로 제거
     df = df[df["국가"] != "현금"].reset_index(drop=True)
     usd_krw = get_usd_krw()
     log.info(f"  💱 USD/KRW: {usd_krw:,.1f}")
@@ -480,7 +473,6 @@ def fetch_prices(df: pd.DataFrame) -> pd.DataFrame:
         else:
             returns.append(round((price - avg) / avg * 100, 2))
 
-    # ── 비중(%) 자동 계산: 종목 평가금액 / 총 평가금액 ──
     eval_amounts = []
     for i, (_, row) in enumerate(df.iterrows()):
         currency = str(row["통화"]).upper()
@@ -513,14 +505,17 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 
 
-def _build_portfolio_tabs(all_portfolios: dict, current_pname: str) -> str:
-    """포트폴리오 탭 HTML 생성"""
+def _build_portfolio_tabs(
+    all_portfolios: dict,
+    current_pname: str,
+    uid: int = 0,
+    token: str = "",
+) -> str:
     if not all_portfolios:
         return ""
     tabs = ""
     for pname, p in all_portfolios.items():
         name = p.get("name", pname)
-        # 이름 안의 따옴표 이스케이프
         name_esc = name.replace("'", "\\'")
         if pname == current_pname:
             del_btn = ""
@@ -540,7 +535,7 @@ def _build_portfolio_tabs(all_portfolios: dict, current_pname: str) -> str:
                 f'{name}{ren_btn}{del_btn}</span>'
             )
         else:
-            tabs += f'<a href="/p/{pname}" class="tab">{name}</a>'
+            tabs += f'<a href="/u/{uid}/p/{pname}?t={token}" class="tab">{name}</a>'
     tabs += (
         '<button onclick="openNewPortfolioModal()" title="새 포트폴리오" '
         'style="display:inline-flex;align-items:center;height:52px;padding:0 10px;'
@@ -556,6 +551,8 @@ def build_user_html(
     cashflows: list = None,
     pname: str = "",
     all_portfolios: dict = None,
+    uid: int = 0,
+    token: str = "",
 ) -> str:
     today_str  = datetime.now().strftime("%Y.%m.%d %H:%M")
     cashflows  = cashflows or []
@@ -564,10 +561,9 @@ def build_user_html(
         sum(c["amount"] for c in cashflows if c["type"] == "in")
         - sum(c["amount"] for c in cashflows if c["type"] == "out")
     )
-    portfolio_tabs = _build_portfolio_tabs(all_portfolios or {}, pname)
+    portfolio_tabs = _build_portfolio_tabs(all_portfolios or {}, pname, uid=uid, token=token)
 
-    # 수익률 추이 히스토리 데이터
-    hist        = load_history(pname or "")
+    hist        = load_history(uid, pname) if pname else {}
     hist_dates  = sorted(hist.keys())
     hist_twr_vals = [hist[d].get("total_return") for d in hist_dates]
     hist_mwr_vals = [hist[d].get("mwr") for d in hist_dates]
@@ -576,7 +572,6 @@ def build_user_html(
     hist_mwr_js   = json.dumps([round(v, 4) if v is not None else None for v in hist_mwr_vals])
     show_hist     = len(hist_dates) > 1
 
-    # 기간별 수익률 계산 (MWR 기준)
     def _period_ret(days):
         if not hist:
             return None
@@ -649,23 +644,19 @@ def build_user_html(
         "#10b981","#f97316","#06b6d4","#84cc16","#ec4899","#6366f1",
     ]
 
-    # ── 빈 df 방어: 필수 컬럼 보장 ──
     for col in ["수익률(%)", "등락률(%)", "현재가", "USD_KRW"]:
         if col not in df.columns:
             df = df.copy()
             df[col] = float("nan")
 
-    # ── 수익률 계산 ──
     valid = df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
     total_return = (
         (valid["비중(%)"] * valid["수익률(%)"]).sum() / valid["비중(%)"].sum()
         if not valid.empty else 0.0
     )
 
-    # ── 환율 ──
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
 
-    # ── 현금 자동 계산 ──
     stock_eval_krw = 0.0
     for _, _r in df.iterrows():
         _mult  = usd_krw if str(_r["통화"]).upper() == "USD" else 1.0
@@ -674,13 +665,11 @@ def build_user_html(
         _price = float(_cur) if pd.notna(_cur) else float(_r["평단가"])
         stock_eval_krw += _price * _qty * _mult
     cash_krw    = max(0.0, net_investment - stock_eval_krw) if net_investment > 0 else 0.0
-    total_ev    = stock_eval_krw + cash_krw          # 최종 총 평가금액
+    total_ev    = stock_eval_krw + cash_krw
     show_cash   = net_investment > 0 and cash_krw > 0
     _w_scale    = stock_eval_krw / total_ev if total_ev > 0 else 1.0
     cash_wpct   = round(cash_krw / total_ev * 100, 2) if total_ev > 0 else 0.0
 
-    # ── 차트 데이터 ──
-    # 종목별 비중 차트: 1% 미만은 "기타"로 합산
     _w_main = df[df["비중(%)"] >= 1.0]
     _w_small = df[df["비중(%)"] < 1.0]
     if not _w_small.empty:
@@ -688,9 +677,7 @@ def build_user_html(
         _w_chart = pd.concat([_w_main[["종목명", "비중(%)"]], _other], ignore_index=True)
     else:
         _w_chart = _w_main[["종목명", "비중(%)"]].copy()
-    # 비중 차트 색상: name_to_idx 기준으로 매핑 (수익률 차트와 동일)
     name_to_idx = {name: i for i, name in enumerate(df["종목명"].tolist())}
-    # 현금 포함 비중 재계산 (주식 비중 × _w_scale)
     _w_chart = _w_chart.copy()
     _w_chart["비중(%)"] = (_w_chart["비중(%)"] * _w_scale).round(2)
     if show_cash:
@@ -705,12 +692,10 @@ def build_user_html(
         for n in _w_chart["종목명"].tolist()
     ])
 
-    # 국가별 비중 차트: _w_scale 적용 후 현금 추가
     cg = df.groupby("국가")["비중(%)"].sum().reset_index()
     _cg_total = cg["비중(%)"].sum()
     if _cg_total > 0:
         cg["비중(%)"] = (cg["비중(%)"] / _cg_total * 100 * _w_scale).round(2)
-    # 국가별 색상: 해당 국가의 첫 번째 종목 색상 사용
     _country_color_list = []
     for c in cg["국가"].tolist():
         first_stock = df[df["국가"] == c]["종목명"].iloc[0] if not df[df["국가"] == c].empty else None
@@ -726,7 +711,6 @@ def build_user_html(
     cd = json.dumps(cg["비중(%)"].tolist())
     country_colors = json.dumps(_country_color_list)
 
-    # 수익률 막대 차트 (낮→높)
     ret_df = (
         df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
         .sort_values("수익률(%)", ascending=True)
@@ -737,7 +721,6 @@ def build_user_html(
     ret_count    = len(ret_df)
     ret_chart_h  = max(160, ret_count * 56)
 
-    # ── 매수/평가금액 & 테이블 행 ──
     total_buy = total_eval = 0.0
     name_to_color = {name: PALETTE[i % len(PALETTE)] for i, name in enumerate(df["종목명"].tolist())}
     table_rows = ""
@@ -754,7 +737,6 @@ def build_user_html(
         name       = r["종목명"]
         initial    = name[0].upper()
 
-        # 수익률 (누적, 평단가 대비)
         if pd.isna(ret_val):
             ret_str, ret_col = "—", "#94a3b8"
         elif ret_val > 0:
@@ -764,7 +746,6 @@ def build_user_html(
         else:
             ret_str, ret_col = "0.00%", "#64748b"
 
-        # 일등락 (전일 대비)
         if pd.isna(chg_val):
             chg_str, chg_col = "—", "#94a3b8"
         elif chg_val > 0:
@@ -827,14 +808,12 @@ def build_user_html(
           {edit_btns}
         </tr>"""
 
-    # ── 요약 수치 ──
-    total_eval   += cash_krw                          # 주식 평가금액 + 자동 현금
+    total_eval   += cash_krw
     total_pnl     = total_eval - total_buy
     total_pnl_pct = (total_pnl / total_buy * 100) if total_buy > 0 else 0.0
     cash_weight   = round(cash_krw / total_eval * 100, 1) if total_eval > 0 else 0.0
-    stock_count   = len(df)                           # fetch_prices에서 이미 현금 제거됨
+    stock_count   = len(df)
 
-    # ── 일일 수익 계산 (전일 대비 등락률 기준) ──
     daily_pnl = 0.0
     for _, r in df.iterrows():
         chg = r.get("등락률(%)")
@@ -855,7 +834,6 @@ def build_user_html(
             return f"₩{v/1e4:,.0f}만"
         return f"₩{v:,.0f}"
 
-    # 현금 테이블 행 자동 추가
     if show_cash:
         table_rows += (
             f'<tr>'
@@ -871,10 +849,8 @@ def build_user_html(
             f'</tr>'
         )
 
-    # 순 투자원금 표시
     net_inv_disp = fmt_krw(net_investment) if cashflows else "—"
 
-    # 자금 기록 테이블 행 (f-string 진입 전 계산)
     if cashflows:
         cf_rows = ""
         for cf in reversed(cashflows):
@@ -893,7 +869,6 @@ def build_user_html(
     else:
         cf_rows = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:28px">자금 기록이 없습니다</td></tr>'
 
-    # 수익률 추이 차트 HTML/JS (f-string 진입 전 계산)
     if show_hist:
         hist_chart_html = (
             '<div class="card" style="margin-bottom:16px">'
@@ -994,8 +969,6 @@ body {{
   font-size:14px;
   -webkit-font-smoothing:antialiased;
 }}
-
-/* ── 상단 네비 ── */
 .topnav {{
   background:var(--surface);
   border-bottom:1px solid var(--border);
@@ -1019,11 +992,7 @@ body {{
   gap:7px;
   flex-shrink:0;
 }}
-.brand-dot {{
-  width:7px; height:7px;
-  border-radius:50%;
-  background:var(--accent);
-}}
+.brand-dot {{ width:7px; height:7px; border-radius:50%; background:var(--accent); }}
 .tab {{
   display:inline-flex;
   align-items:center;
@@ -1039,21 +1008,8 @@ body {{
 }}
 .tab:hover {{ color:var(--text); }}
 .tab.active {{ color:var(--text); font-weight:700; border-bottom-color:var(--accent); }}
-.nav-time {{
-  margin-left:auto;
-  font-size:.72rem;
-  color:var(--muted);
-  flex-shrink:0;
-}}
-
-/* ── 메인 레이아웃 ── */
-.main {{
-  max-width:1160px;
-  margin:0 auto;
-  padding:28px 20px 48px;
-}}
-
-/* ── Overview 카드 ── */
+.nav-time {{ margin-left:auto; font-size:.72rem; color:var(--muted); flex-shrink:0; }}
+.main {{ max-width:1160px; margin:0 auto; padding:28px 20px 48px; }}
 .overview {{
   background:var(--surface);
   border-radius:14px;
@@ -1066,217 +1022,69 @@ body {{
   flex-wrap:wrap;
   row-gap:16px;
 }}
-.ov-main {{
-  flex-shrink:0;
-  padding-right:30px;
-  border-right:1px solid var(--border);
-  margin-right:30px;
-}}
-.ov-main .ov-label {{
-  font-size:.68rem;
-  color:var(--muted);
-  text-transform:uppercase;
-  letter-spacing:.1em;
-  margin-bottom:6px;
-  font-weight:600;
-}}
-.ov-main .ov-value {{
-  font-size:2.1rem;
-  font-weight:700;
-  color:var(--text);
-  letter-spacing:-.03em;
-  line-height:1;
-}}
-.ov-metrics {{
-  display:flex;
-  gap:0;
-  flex-wrap:wrap;
-}}
-.ov-metric {{
-  padding:0 26px;
-  border-right:1px solid var(--border);
-  display:flex;
-  flex-direction:column;
-  gap:5px;
-}}
+.ov-main {{ flex-shrink:0; padding-right:30px; border-right:1px solid var(--border); margin-right:30px; }}
+.ov-main .ov-label {{ font-size:.68rem; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; margin-bottom:6px; font-weight:600; }}
+.ov-main .ov-value {{ font-size:2.1rem; font-weight:700; color:var(--text); letter-spacing:-.03em; line-height:1; }}
+.ov-metrics {{ display:flex; gap:0; flex-wrap:wrap; }}
+.ov-metric {{ padding:0 26px; border-right:1px solid var(--border); display:flex; flex-direction:column; gap:5px; }}
 .ov-metric:last-child {{ border-right:none; }}
-.m-label {{
-  font-size:.68rem;
-  color:var(--muted);
-  text-transform:uppercase;
-  letter-spacing:.08em;
-  font-weight:600;
-}}
-.m-value {{
-  font-size:1.15rem;
-  font-weight:700;
-  line-height:1;
-}}
-.m-sub {{
-  font-size:.72rem;
-  color:var(--muted);
-}}
-
-/* ── 차트 그리드 ── */
-.charts-grid {{
-  display:grid;
-  grid-template-columns:1fr 1fr 1fr;
-  gap:14px;
-  margin-bottom:16px;
-}}
+.m-label {{ font-size:.68rem; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-weight:600; }}
+.m-value {{ font-size:1.15rem; font-weight:700; line-height:1; }}
+.m-sub {{ font-size:.72rem; color:var(--muted); }}
+.charts-grid {{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; margin-bottom:16px; }}
 @media(max-width:1000px) {{ .charts-grid {{ grid-template-columns:1fr 1fr; }} }}
 @media(max-width:640px)  {{ .charts-grid {{ grid-template-columns:1fr; }} }}
-
-/* ── 카드 공통 ── */
-.card {{
-  background:var(--surface);
-  border-radius:14px;
-  box-shadow:var(--shadow);
-  padding:22px;
-}}
+.card {{ background:var(--surface); border-radius:14px; box-shadow:var(--shadow); padding:22px; }}
 .card-title {{
-  font-size:.7rem;
-  font-weight:700;
-  color:var(--secondary);
-  text-transform:uppercase;
-  letter-spacing:.12em;
-  margin-bottom:16px;
-  display:flex;
-  align-items:center;
-  gap:8px;
+  font-size:.7rem; font-weight:700; color:var(--secondary);
+  text-transform:uppercase; letter-spacing:.12em; margin-bottom:16px;
+  display:flex; align-items:center; gap:8px;
 }}
 .card-title::before {{
-  content:"";
-  display:inline-block;
-  width:3px; height:11px;
-  background:var(--accent);
-  border-radius:2px;
-  flex-shrink:0;
+  content:""; display:inline-block; width:3px; height:11px;
+  background:var(--accent); border-radius:2px; flex-shrink:0;
 }}
-
-/* ── 테이블 카드 ── */
-.table-card {{
-  background:var(--surface);
-  border-radius:14px;
-  box-shadow:var(--shadow);
-  padding:22px;
-  margin-bottom:16px;
-  overflow-x:auto;
-}}
-.table-header {{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  margin-bottom:16px;
-}}
-.badge {{
-  background:#f1f5f9;
-  color:var(--secondary);
-  font-size:.7rem;
-  font-weight:700;
-  padding:3px 10px;
-  border-radius:99px;
-}}
+.table-card {{ background:var(--surface); border-radius:14px; box-shadow:var(--shadow); padding:22px; margin-bottom:16px; overflow-x:auto; }}
+.table-header {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }}
+.badge {{ background:#f1f5f9; color:var(--secondary); font-size:.7rem; font-weight:700; padding:3px 10px; border-radius:99px; }}
 table {{ width:100%; border-collapse:collapse; }}
-thead th {{
-  font-size:.7rem;
-  text-transform:uppercase;
-  letter-spacing:.07em;
-  color:var(--muted);
-  font-weight:700;
-  padding:8px 10px;
-  border-bottom:1px solid var(--border);
-  text-align:left;
-}}
-tbody tr {{
-  border-bottom:1px solid var(--border-subtle);
-  transition:background .1s;
-}}
+thead th {{ font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); font-weight:700; padding:8px 10px; border-bottom:1px solid var(--border); text-align:left; }}
+tbody tr {{ border-bottom:1px solid var(--border-subtle); transition:background .1s; }}
 tbody tr:last-child {{ border-bottom:none; }}
 tbody tr:hover {{ background:#f8fafc; }}
 tbody td {{ padding:12px 10px; }}
 .num {{ text-align:right; font-variant-numeric:tabular-nums; }}
-
-/* ── 푸터 ── */
-.footer {{
-  text-align:center;
-  padding:28px 0 4px;
-  font-size:.65rem;
-  color:#cbd5e1;
-  letter-spacing:.1em;
-  text-transform:uppercase;
-}}
-
-/* ── 애니메이션 ── */
-@keyframes fadeIn {{
-  from {{ opacity:0; transform:translateY(10px); }}
-  to   {{ opacity:1; transform:translateY(0); }}
-}}
+.footer {{ text-align:center; padding:28px 0 4px; font-size:.65rem; color:#cbd5e1; letter-spacing:.1em; text-transform:uppercase; }}
+@keyframes fadeIn {{ from {{ opacity:0; transform:translateY(10px); }} to {{ opacity:1; transform:translateY(0); }} }}
 .overview {{ animation:fadeIn .3s ease both; }}
 .charts-grid .card:nth-child(1) {{ animation:fadeIn .3s .04s ease both; }}
 .charts-grid .card:nth-child(2) {{ animation:fadeIn .3s .08s ease both; }}
 .charts-grid .card:nth-child(3) {{ animation:fadeIn .3s .12s ease both; }}
 .table-card {{ animation:fadeIn .3s .16s ease both; }}
-
-/* ── 모달 ── */
-.modal-overlay {{
-  display:none; position:fixed; inset:0;
-  background:rgba(0,0,0,.35); z-index:300;
-  align-items:center; justify-content:center;
-}}
+.modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:300; align-items:center; justify-content:center; }}
 .modal-overlay.open {{ display:flex; }}
-.modal-box {{
-  background:#fff; border-radius:16px;
-  padding:28px; width:400px; max-width:92vw;
-  box-shadow:0 20px 60px rgba(0,0,0,.15);
-}}
-.modal-title {{
-  font-size:1rem; font-weight:700; color:var(--text);
-  margin-bottom:20px;
-}}
+.modal-box {{ background:#fff; border-radius:16px; padding:28px; width:400px; max-width:92vw; box-shadow:0 20px 60px rgba(0,0,0,.15); }}
+.modal-title {{ font-size:1rem; font-weight:700; color:var(--text); margin-bottom:20px; }}
 .form-group {{ display:flex; flex-direction:column; gap:5px; margin-bottom:14px; }}
-.form-label {{
-  font-size:.68rem; font-weight:700; color:var(--secondary);
-  text-transform:uppercase; letter-spacing:.08em;
-}}
-.form-input, .form-select {{
-  border:1px solid var(--border); border-radius:8px;
-  padding:9px 12px; font-size:.88rem; color:var(--text);
-  font-family:inherit; outline:none; width:100%;
-  transition:border-color .15s;
-}}
+.form-label {{ font-size:.68rem; font-weight:700; color:var(--secondary); text-transform:uppercase; letter-spacing:.08em; }}
+.form-input, .form-select {{ border:1px solid var(--border); border-radius:8px; padding:9px 12px; font-size:.88rem; color:var(--text); font-family:inherit; outline:none; width:100%; transition:border-color .15s; }}
 .form-input:focus, .form-select:focus {{ border-color:var(--accent); }}
 .form-row {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
 .modal-actions {{ display:flex; gap:10px; justify-content:flex-end; margin-top:22px; }}
-.btn-cancel {{
-  background:#f1f5f9; border:none; border-radius:8px;
-  padding:8px 18px; cursor:pointer; font-size:.85rem;
-  font-weight:600; color:var(--secondary);
-}}
-.btn-save {{
-  background:var(--accent); border:none; border-radius:8px;
-  padding:8px 20px; cursor:pointer; font-size:.85rem;
-  font-weight:700; color:#fff;
-}}
+.btn-cancel {{ background:#f1f5f9; border:none; border-radius:8px; padding:8px 18px; cursor:pointer; font-size:.85rem; font-weight:600; color:var(--secondary); }}
+.btn-save {{ background:var(--accent); border:none; border-radius:8px; padding:8px 20px; cursor:pointer; font-size:.85rem; font-weight:700; color:#fff; }}
 .btn-save:disabled {{ opacity:.6; cursor:not-allowed; }}
 </style>
 </head>
 <body>
 
-<!-- 상단 네비 -->
 <nav class="topnav">
-  <div class="brand">
-    <div class="brand-dot"></div>
-    PORTFOLIO
-  </div>
+  <div class="brand"><div class="brand-dot"></div>PORTFOLIO</div>
   {portfolio_tabs}
   <div class="nav-time">기준: {today_str}</div>
 </nav>
 
-<!-- 메인 -->
 <div class="main">
-
-  <!-- Overview -->
   <div class="overview">
     <div class="ov-main">
       <div class="ov-label">총 평가금액</div>
@@ -1316,37 +1124,25 @@ tbody td {{ padding:12px 10px; }}
     </div>
   </div>
 
-  <!-- 비중 차트 2개 -->
   <div class="charts-grid" style="grid-template-columns:1fr 1fr">
     <div class="card">
       <div class="card-title">종목별 비중</div>
-      <div style="position:relative;height:220px">
-        <canvas id="weightChart"></canvas>
-      </div>
+      <div style="position:relative;height:220px"><canvas id="weightChart"></canvas></div>
     </div>
     <div class="card">
       <div class="card-title">국가별 비중</div>
-      <div style="position:relative;height:220px">
-        <canvas id="countryChart"></canvas>
-      </div>
+      <div style="position:relative;height:220px"><canvas id="countryChart"></canvas></div>
     </div>
   </div>
 
-  <!-- 수익률 차트 (전체 너비) -->
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">종목별 수익률</div>
-    <div style="position:relative;height:{ret_chart_h}px">
-      <canvas id="returnChart"></canvas>
-    </div>
+    <div style="position:relative;height:{ret_chart_h}px"><canvas id="returnChart"></canvas></div>
   </div>
 
-  <!-- 기간별 수익률 -->
   {period_html}
-
-  <!-- 수익률 추이 차트 -->
   {hist_chart_html}
 
-  <!-- 종목 테이블 -->
   <div class="table-card">
     <div class="table-header">
       <div class="card-title" style="margin-bottom:0">전체 포지션</div>
@@ -1355,22 +1151,15 @@ tbody td {{ padding:12px 10px; }}
     <table>
       <thead>
         <tr>
-          <th>종목명</th>
-          <th class="num">평균단가</th>
-          <th class="num">현재가</th>
-          <th class="num">일등락</th>
-          <th class="num">수익률</th>
-          <th class="num">비중</th>
-          <th class="num">매수금액</th>
-          <th class="num">평가금액</th>
-          {action_th}
+          <th>종목명</th><th class="num">평균단가</th><th class="num">현재가</th>
+          <th class="num">일등락</th><th class="num">수익률</th><th class="num">비중</th>
+          <th class="num">매수금액</th><th class="num">평가금액</th>{action_th}
         </tr>
       </thead>
       <tbody>{table_rows}</tbody>
     </table>
   </div>
 
-  <!-- 자금 기록 -->
   <div class="table-card" style="margin-top:16px">
     <div class="table-header">
       <div class="card-title" style="margin-bottom:0">자금 기록</div>
@@ -1381,12 +1170,7 @@ tbody td {{ padding:12px 10px; }}
     </div>
     <table>
       <thead>
-        <tr>
-          <th>날짜</th>
-          <th>구분</th>
-          <th class="num">금액</th>
-          <th>메모</th>
-        </tr>
+        <tr><th>날짜</th><th>구분</th><th class="num">금액</th><th>메모</th></tr>
       </thead>
       <tbody>{cf_rows}</tbody>
     </table>
@@ -1491,8 +1275,9 @@ tbody td {{ padding:12px 10px; }}
 </div>
 
 <script>
-// ── 기본 설정 ──
 const PNAME = "{pname_js}";
+const UID   = {uid};
+const TOKEN = "{token}";
 let _editMode = false, _editName = '';
 let _renamePname = '';
 
@@ -1529,18 +1314,14 @@ function openEditModal(d) {{
   document.getElementById('modal').classList.add('open');
 }}
 
-function closeModal() {{
-  document.getElementById('modal').classList.remove('open');
-}}
+function closeModal() {{ document.getElementById('modal').classList.remove('open'); }}
 
 async function saveStock() {{
   const btn = document.getElementById('btn-save');
   btn.disabled = true; btn.textContent = '저장 중...';
   const isCash = document.getElementById('f-country').value === '현금';
   const payload = isCash ? {{
-    종목명: '현금',
-    국가:   '현금',
-    수량:   1,
+    종목명: '현금', 국가: '현금', 수량: 1,
     평단가: parseFloat(document.getElementById('f-cash').value) || 0,
   }} : {{
     종목명: document.getElementById('f-name').value.trim(),
@@ -1550,7 +1331,7 @@ async function saveStock() {{
   }};
   if (!isCash && !payload.종목명) {{ alert('종목명을 입력하세요'); btn.disabled=false; btn.textContent='저장'; return; }}
   try {{
-    const res = await fetch(`/api/p/${{PNAME}}/stock`, {{
+    const res = await fetch(`/u/${{UID}}/api/p/${{PNAME}}/stock?t=${{TOKEN}}`, {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify(payload),
@@ -1562,7 +1343,7 @@ async function saveStock() {{
 
 async function deleteStock(name) {{
   if (!confirm(`"${{name}}" 종목을 삭제할까요?`)) return;
-  const res = await fetch(`/api/p/${{PNAME}}/stock/${{encodeURIComponent(name)}}`, {{method:'DELETE'}});
+  const res = await fetch(`/u/${{UID}}/api/p/${{PNAME}}/stock/${{encodeURIComponent(name)}}?t=${{TOKEN}}`, {{method:'DELETE'}});
   if (res.ok) {{ location.reload(); }}
   else {{ const e = await res.json(); alert('오류: ' + e.error); }}
 }}
@@ -1574,7 +1355,7 @@ async function refreshPrices() {{
   try {{
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), 120000);
-    const res  = await fetch(`/api/p/${{PNAME}}/refresh`, {{method:'POST', signal: ctrl.signal}});
+    const res  = await fetch(`/u/${{UID}}/api/p/${{PNAME}}/refresh?t=${{TOKEN}}`, {{method:'POST', signal: ctrl.signal}});
     clearTimeout(tid);
     if (res.ok) {{ location.reload(); }}
     else {{ const e = await res.json(); alert('가격 조회 오류: ' + e.error); }}
@@ -1585,12 +1366,10 @@ async function refreshPrices() {{
   }}
 }}
 
-// 모달 외부 클릭 닫기
 document.getElementById('modal').addEventListener('click', function(e) {{
   if (e.target === this) closeModal();
 }});
 
-// ── 포트폴리오 관리 ──
 function openNewPortfolioModal() {{
   document.getElementById('new-ptab-name').value = '';
   document.getElementById('new-ptab-modal').classList.add('open');
@@ -1602,14 +1381,14 @@ function closeNewPortfolioModal() {{
 async function createPortfolio() {{
   const name = document.getElementById('new-ptab-name').value.trim();
   if (!name) {{ alert('이름을 입력하세요'); return; }}
-  const res = await fetch('/api/portfolios', {{
+  const res = await fetch(`/u/${{UID}}/api/portfolios?t=${{TOKEN}}`, {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{ name }}),
   }});
   if (res.ok) {{
     const d = await res.json();
-    location.href = '/p/' + d.pname;
+    location.href = `/u/${{UID}}/p/${{d.pname}}?t=${{TOKEN}}`;
   }} else {{
     const e = await res.json(); alert('오류: ' + e.error);
   }}
@@ -1627,7 +1406,7 @@ function closeRenameModal() {{
 async function saveRename() {{
   const name = document.getElementById('rename-ptab-name').value.trim();
   if (!name) {{ alert('이름을 입력하세요'); return; }}
-  const res = await fetch('/api/portfolios/' + _renamePname, {{
+  const res = await fetch(`/u/${{UID}}/api/portfolios/${{_renamePname}}?t=${{TOKEN}}`, {{
     method: 'PATCH',
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{ name }}),
@@ -1638,7 +1417,7 @@ async function saveRename() {{
 
 async function deletePortfolio(pname) {{
   if (!confirm('이 포트폴리오를 삭제할까요?\\n모든 데이터(종목, 자금기록, 히스토리)가 삭제됩니다.')) return;
-  const res = await fetch('/api/portfolios/' + pname, {{ method: 'DELETE' }});
+  const res = await fetch(`/u/${{UID}}/api/portfolios/${{pname}}?t=${{TOKEN}}`, {{ method: 'DELETE' }});
   if (res.ok) {{
     const d = await res.json();
     location.href = d.redirect;
@@ -1654,7 +1433,6 @@ document.getElementById('rename-ptab-modal').addEventListener('click', function(
   if (e.target === this) closeRenameModal();
 }});
 
-// ── 자금 기록 ──
 function openCashflowModal() {{
   document.getElementById('cf-amount').value = '';
   document.getElementById('cf-memo').value   = '';
@@ -1676,7 +1454,7 @@ async function saveCashflow() {{
     return;
   }}
   try {{
-    const res = await fetch(`/api/cashflow/${{PNAME}}`, {{
+    const res = await fetch(`/u/${{UID}}/api/cashflow/${{PNAME}}?t=${{TOKEN}}`, {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{ type, amount, memo }}),
@@ -1696,7 +1474,6 @@ document.getElementById('cf-modal').addEventListener('click', function(e) {{
   if (e.target === this) closeCashflowModal();
 }});
 
-// ── 차트 초기화 ──
 try {{
   Chart.defaults.font.family = "'Noto Sans KR',sans-serif";
   Chart.defaults.color = "#94a3b8";
@@ -1708,26 +1485,15 @@ try {{
     type: "doughnut",
     data: {{
       labels,
-      datasets: [{{
-        data,
-        backgroundColor: colors,
-        borderWidth: 3,
-        borderColor: "#fff",
-        hoverOffset: 6,
-      }}],
+      datasets: [{{ data, backgroundColor: colors, borderWidth: 3, borderColor: "#fff", hoverOffset: 6 }}],
     }},
     options: {{
       responsive: true,
       maintainAspectRatio: false,
       cutout: "65%",
       plugins: {{
-        legend: {{
-          position: "bottom",
-          labels: {{ boxWidth: 9, padding: 12, font: {{ size: 11 }}, color: "#64748b" }},
-        }},
-        tooltip: {{
-          callbacks: {{ label: c => ` ${{c.label}}: ${{c.parsed}}%` }},
-        }},
+        legend: {{ position: "bottom", labels: {{ boxWidth: 9, padding: 12, font: {{ size: 11 }}, color: "#64748b" }} }},
+        tooltip: {{ callbacks: {{ label: c => ` ${{c.label}}: ${{c.parsed}}%` }} }},
       }},
     }},
   }});
@@ -1739,13 +1505,7 @@ try {{
     type: "bar",
     data: {{
       labels: {rl},
-      datasets: [{{
-        label: "수익률(%)",
-        data: {rd},
-        backgroundColor: {rc},
-        borderRadius: 4,
-        borderSkipped: false,
-      }}],
+      datasets: [{{ label: "수익률(%)", data: {rd}, backgroundColor: {rc}, borderRadius: 4, borderSkipped: false }}],
     }},
     options: {{
       indexAxis: "y",
@@ -1753,24 +1513,11 @@ try {{
       maintainAspectRatio: false,
       plugins: {{
         legend: {{ display: false }},
-        tooltip: {{
-          callbacks: {{
-            label: c => ` ${{c.parsed.x >= 0 ? "+" : ""}}${{c.parsed.x.toFixed(2)}}%`,
-          }},
-        }},
+        tooltip: {{ callbacks: {{ label: c => ` ${{c.parsed.x >= 0 ? "+" : ""}}${{c.parsed.x.toFixed(2)}}%` }} }},
       }},
       scales: {{
-        x: {{
-          grid: {{ color: "#f1f5f9" }},
-          ticks: {{
-            color: "#94a3b8",
-            callback: v => (v >= 0 ? "+" : "") + v + "%",
-          }},
-        }},
-        y: {{
-          grid: {{ display: false }},
-          ticks: {{ color: "#64748b", font: {{ size: 11 }} }},
-        }},
+        x: {{ grid: {{ color: "#f1f5f9" }}, ticks: {{ color: "#94a3b8", callback: v => (v >= 0 ? "+" : "") + v + "%" }} }},
+        y: {{ grid: {{ display: false }}, ticks: {{ color: "#64748b", font: {{ size: 11 }} }} }},
       }},
     }},
   }});
@@ -1814,16 +1561,15 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-    load_portfolios, save_portfolios,
-    create_portfolio, rename_portfolio, delete_portfolio,
-    save_snapshot, load_cashflow, add_cashflow,
-)
-
 # ══════════════════════════════════════════
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "여기에_텔레그램_토큰_입력")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 NGROK_TOKEN      = os.getenv("NGROK_TOKEN",       "여기에_ngrok_토큰_입력")
-FLASK_PORT       = 5050
+FLASK_PORT       = int(os.getenv("FLASK_PORT",    "5050"))
+# USE_NGROK=false → ngrok 없이 Flask 직접 노출 (GCP 등 공인 IP 서버에서 사용)
+# FLASK_PUBLIC_URL → 외부에서 접근 가능한 URL (예: http://34.xx.xx.xx:5050)
+USE_NGROK        = os.getenv("USE_NGROK", "true").lower() not in ("false", "0", "no")
+FLASK_PUBLIC_URL = os.getenv("FLASK_PUBLIC_URL", "")
 KST              = pytz.timezone("Asia/Seoul")
 # ══════════════════════════════════════════
 
@@ -1834,22 +1580,38 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── 전역 상태 ──
-# portfolios[pname] = { "name", "last_update", "df" }
-portfolios:   dict = {}
-active_pname: str  = ""
-public_url:   str  = ""
+# all_users[uid] = {"portfolios": {pname: {...}}, "active_pname": ""}
+all_users:   dict      = {}
+_users_lock: threading.Lock = threading.Lock()
+public_url:  str       = ""
+tg_bot:      Bot | None = None
 
 # ── 대시보드 빌드 중복 방지 ──
 _build_lock  = threading.Lock()   # _building / _hist_check 접근용
-_building:   set  = set()         # 현재 빌드 중인 pname
-_hist_check: dict = {}            # pname -> "YYYY-MM-DD" (오늘 이미 완료)
+_building:   set  = set()         # (uid, pname) 튜플
+_hist_check: dict = {}            # (uid, pname) -> "YYYY-MM-DD"
 
 app_flask    = Flask(__name__)
 REQUIRED_COLS = {"종목명", "국가", "평단가", "수량", "통화"}
 
 
-def _is_owner(update: Update) -> bool:
-    return update.effective_user.id == TELEGRAM_CHAT_ID
+def _get_user_state(uid: int) -> dict:
+    """uid의 상태 반환. 없으면 디스크에서 로드 (double-checked locking)."""
+    if uid not in all_users:
+        with _users_lock:
+            if uid not in all_users:
+                portfolios, active_pname = load_portfolios(uid)
+                all_users[uid] = {"portfolios": portfolios, "active_pname": active_pname}
+    return all_users[uid]
+
+
+def _check_token(uid: int):
+    """URL 토큰 검증. 불일치 또는 빈 토큰이면 403."""
+    token = request.args.get("t", "")
+    if not token:
+        abort(403)
+    if not _secrets.compare_digest(token, get_user_token(uid)):
+        abort(403)
 
 
 @app_flask.after_request
@@ -1863,41 +1625,73 @@ def skip_ngrok_warning(response):
 # ────────────────────────────────────────
 @app_flask.route("/")
 def index():
-    if active_pname and active_pname in portfolios:
-        return redirect(f"/p/{active_pname}")
-    if portfolios:
-        return redirect(f"/p/{next(iter(portfolios))}")
+    """레거시 진입점 — TELEGRAM_CHAT_ID 기준으로 리다이렉트."""
+    uid   = TELEGRAM_CHAT_ID
+    token = get_user_token(uid)
+    state = _get_user_state(uid)
+    pname = state["active_pname"]
+    if pname and pname in state["portfolios"]:
+        return redirect(f"/u/{uid}/p/{pname}?t={token}")
+    if state["portfolios"]:
+        return redirect(f"/u/{uid}/p/{next(iter(state['portfolios']))}?t={token}")
     return "<p>포트폴리오 없음</p>", 404
 
 
 @app_flask.route("/p/<pname>")
-def portfolio_page(pname: str):
-    global active_pname
-    if pname not in portfolios:
+def legacy_portfolio_page(pname: str):
+    """레거시 URL → 새 URL 리다이렉트."""
+    uid   = TELEGRAM_CHAT_ID
+    token = get_user_token(uid)
+    return redirect(f"/u/{uid}/p/{pname}?t={token}")
+
+
+@app_flask.route("/u/<int:uid>")
+def index_user(uid: int):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    token = get_user_token(uid)
+    pname = state["active_pname"]
+    if pname and pname in state["portfolios"]:
+        return redirect(f"/u/{uid}/p/{pname}?t={token}")
+    if state["portfolios"]:
+        return redirect(f"/u/{uid}/p/{next(iter(state['portfolios']))}?t={token}")
+    return "<p>포트폴리오 없음</p>", 404
+
+
+@app_flask.route("/u/<int:uid>/p/<pname>")
+def portfolio_page(uid: int, pname: str):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    if pname not in state["portfolios"]:
         abort(404)
-    active_pname = pname
-    save_portfolios(portfolios, active_pname)
-    p = portfolios[pname]
+    state["active_pname"] = pname
+    save_portfolios(uid, state["portfolios"], pname)
+    p     = state["portfolios"][pname]
+    token = get_user_token(uid)
     if p.get("df") is not None and len(p["df"]) > 0:
-        _trigger_build_if_needed(pname)
+        _trigger_build_if_needed(uid, pname)
     return build_user_html(
         p["df"],
         display_name=p.get("name", "포트폴리오"),
-        cashflows=load_cashflow(pname),
+        cashflows=load_cashflow(uid, pname),
         pname=pname,
-        all_portfolios=portfolios,
+        all_portfolios=state["portfolios"],
+        uid=uid,
+        token=token,
     )
 
 
 # ── 포트폴리오 관리 ──
-@app_flask.route("/api/portfolios", methods=["POST"])
-def api_create_portfolio():
-    data = request.get_json()
-    name = str(data.get("name", "")).strip()
+@app_flask.route("/u/<int:uid>/api/portfolios", methods=["POST"])
+def api_create_portfolio(uid: int):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    data  = request.get_json()
+    name  = str(data.get("name", "")).strip()
     if not name:
         return jsonify({"error": "이름을 입력하세요"}), 400
-    pname = create_portfolio(name)
-    portfolios[pname] = {
+    pname = create_portfolio(uid, name)
+    state["portfolios"][pname] = {
         "name":        name,
         "last_update": None,
         "df":          pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
@@ -1905,39 +1699,46 @@ def api_create_portfolio():
     return jsonify({"ok": True, "pname": pname})
 
 
-@app_flask.route("/api/portfolios/<pname>", methods=["PATCH"])
-def api_rename_portfolio(pname: str):
-    if pname not in portfolios:
+@app_flask.route("/u/<int:uid>/api/portfolios/<pname>", methods=["PATCH"])
+def api_rename_portfolio(uid: int, pname: str):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    if pname not in state["portfolios"]:
         return jsonify({"error": "포트폴리오 없음"}), 404
     data = request.get_json()
     name = str(data.get("name", "")).strip()
     if not name:
         return jsonify({"error": "이름을 입력하세요"}), 400
-    portfolios[pname]["name"] = name
-    rename_portfolio(pname, name)
+    state["portfolios"][pname]["name"] = name
+    rename_portfolio(uid, pname, name)
     return jsonify({"ok": True})
 
 
-@app_flask.route("/api/portfolios/<pname>", methods=["DELETE"])
-def api_delete_portfolio(pname: str):
-    global active_pname
+@app_flask.route("/u/<int:uid>/api/portfolios/<pname>", methods=["DELETE"])
+def api_delete_portfolio(uid: int, pname: str):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    portfolios = state["portfolios"]
     if pname not in portfolios:
         return jsonify({"error": "포트폴리오 없음"}), 404
     if len(portfolios) <= 1:
         return jsonify({"error": "마지막 포트폴리오는 삭제할 수 없습니다"}), 400
     del portfolios[pname]
-    new_active = delete_portfolio(pname)
+    new_active = delete_portfolio(uid, pname)
     if not new_active or new_active not in portfolios:
         new_active = next(iter(portfolios))
-    active_pname = new_active
-    return jsonify({"ok": True, "redirect": f"/p/{new_active}"})
+    state["active_pname"] = new_active
+    token = get_user_token(uid)
+    return jsonify({"ok": True, "redirect": f"/u/{uid}/p/{new_active}?t={token}"})
 
 
 # ── 종목 추가/수정 ──
-@app_flask.route("/api/p/<pname>/stock", methods=["POST"])
-def api_add_stock(pname: str):
-    if pname not in portfolios:
-        portfolios[pname] = {
+@app_flask.route("/u/<int:uid>/api/p/<pname>/stock", methods=["POST"])
+def api_add_stock(uid: int, pname: str):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    if pname not in state["portfolios"]:
+        state["portfolios"][pname] = {
             "name": pname, "last_update": None,
             "df": pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
         }
@@ -1949,7 +1750,7 @@ def api_add_stock(pname: str):
         avg      = float(data["평단가"])
         currency = "USD" if country == "US" else "KRW"
 
-        df = portfolios[pname]["df"].copy()
+        df = state["portfolios"][pname]["df"].copy()
         if "비중(%)" not in df.columns:
             df["비중(%)"] = 0.0
         if name in df["종목명"].values:
@@ -1963,49 +1764,55 @@ def api_add_stock(pname: str):
             df = pd.concat([df, new_row], ignore_index=True)
 
         drop_cols = [c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in df.columns]
-        portfolios[pname]["df"] = df.drop(columns=drop_cols)
-        save_portfolios(portfolios, active_pname)
+        state["portfolios"][pname]["df"] = df.drop(columns=drop_cols)
+        save_portfolios(uid, state["portfolios"], state["active_pname"])
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
 
 # ── 종목 삭제 ──
-@app_flask.route("/api/p/<pname>/stock/<path:name>", methods=["DELETE"])
-def api_del_stock(pname: str, name: str):
-    if pname not in portfolios:
+@app_flask.route("/u/<int:uid>/api/p/<pname>/stock/<path:name>", methods=["DELETE"])
+def api_del_stock(uid: int, pname: str, name: str):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    if pname not in state["portfolios"]:
         return jsonify({"error": "포트폴리오 없음"}), 404
-    df = portfolios[pname]["df"]
+    df = state["portfolios"][pname]["df"]
     if name not in df["종목명"].values:
         return jsonify({"error": "종목 없음"}), 404
-    portfolios[pname]["df"] = df[df["종목명"] != name].reset_index(drop=True)
-    save_portfolios(portfolios, active_pname)
+    state["portfolios"][pname]["df"] = df[df["종목명"] != name].reset_index(drop=True)
+    save_portfolios(uid, state["portfolios"], state["active_pname"])
     return jsonify({"ok": True})
 
 
 # ── 가격 재조회 ──
-@app_flask.route("/api/p/<pname>/refresh", methods=["POST"])
-def api_refresh(pname: str):
-    if pname not in portfolios:
+@app_flask.route("/u/<int:uid>/api/p/<pname>/refresh", methods=["POST"])
+def api_refresh(uid: int, pname: str):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    if pname not in state["portfolios"]:
         return jsonify({"error": "포트폴리오 없음"}), 404
-    df = portfolios[pname].get("df")
+    df = state["portfolios"][pname].get("df")
     if df is None or len(df) == 0:
         return jsonify({"error": "종목을 먼저 추가해 주세요"}), 400
     try:
-        build_dashboard_for(pname)
+        build_dashboard_for(uid, pname)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 # ── 자금 기록 ──
-@app_flask.route("/api/cashflow/<pname>", methods=["GET"])
-def api_get_cashflow(pname: str):
-    return jsonify(load_cashflow(pname))
+@app_flask.route("/u/<int:uid>/api/cashflow/<pname>", methods=["GET"])
+def api_get_cashflow(uid: int, pname: str):
+    _check_token(uid)
+    return jsonify(load_cashflow(uid, pname))
 
 
-@app_flask.route("/api/cashflow/<pname>", methods=["POST"])
-def api_add_cashflow_route(pname: str):
+@app_flask.route("/u/<int:uid>/api/cashflow/<pname>", methods=["POST"])
+def api_add_cashflow_route(uid: int, pname: str):
+    _check_token(uid)
     data = request.get_json()
     try:
         type_  = str(data["type"]).strip()
@@ -2015,7 +1822,7 @@ def api_add_cashflow_route(pname: str):
             return jsonify({"error": "type은 'in' 또는 'out'이어야 합니다"}), 400
         if amount <= 0:
             return jsonify({"error": "금액은 0보다 커야 합니다"}), 400
-        add_cashflow(pname, type_, amount, memo)
+        add_cashflow(uid, pname, type_, amount, memo)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -2058,7 +1865,7 @@ def start_ngrok() -> str:
     ngrok_conf.get_default().auth_token = NGROK_TOKEN
     for attempt in range(10):
         try:
-            tunnel    = ngrok.connect(FLASK_PORT, "http")
+            tunnel     = ngrok.connect(FLASK_PORT, "http")
             public_url = tunnel.public_url.replace("http://", "https://")
             log.info(f"🌐 ngrok URL: {public_url}")
             return public_url
@@ -2074,49 +1881,53 @@ def start_ngrok() -> str:
 # ────────────────────────────────────────
 # 가격 조회
 # ────────────────────────────────────────
-def build_dashboard_for(pname: str) -> pd.DataFrame:
-    p      = portfolios[pname]
+def build_dashboard_for(uid: int, pname: str) -> pd.DataFrame:
+    state  = _get_user_state(uid)
+    p      = state["portfolios"][pname]
     df_raw = p["df"].drop(
         columns=[c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in p["df"].columns]
     )
     df = fetch_prices(df_raw)
-    portfolios[pname]["df"]          = df
-    portfolios[pname]["last_update"] = datetime.now(KST)
+    state["portfolios"][pname]["df"]          = df
+    state["portfolios"][pname]["last_update"] = datetime.now(KST)
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
-    save_snapshot(pname, df, usd_krw)
-    save_portfolios(portfolios, active_pname)
+    save_snapshot(uid, pname, df, usd_krw)
+    save_portfolios(uid, state["portfolios"], state["active_pname"])
     return df
 
 
-def _build_dashboard_bg(pname: str) -> None:
+def _build_dashboard_bg(uid: int, pname: str) -> None:
     """백그라운드 스레드용 wrapper — 완료 후 _building에서 제거."""
     try:
-        build_dashboard_for(pname)
+        build_dashboard_for(uid, pname)
     finally:
         with _build_lock:
-            _building.discard(pname)
+            _building.discard((uid, pname))
 
 
-def _trigger_build_if_needed(pname: str) -> None:
+def _trigger_build_if_needed(uid: int, pname: str) -> None:
     """오늘 아직 빌드하지 않았고, 현재 빌드 중이 아닐 때만 스레드 1개 생성."""
     today = datetime.now(KST).strftime("%Y-%m-%d")
+    key   = (uid, pname)
     with _build_lock:
-        if _hist_check.get(pname) == today or pname in _building:
+        if _hist_check.get(key) == today or key in _building:
             return
-        _building.add(pname)
-        _hist_check[pname] = today  # 스레드 시작 전에 기록 (중복 방지)
-    threading.Thread(target=_build_dashboard_bg, args=(pname,), daemon=True).start()
+        _building.add(key)
+        _hist_check[key] = today  # 스레드 시작 전에 기록 (중복 방지)
+    threading.Thread(target=_build_dashboard_bg, args=(uid, pname), daemon=True).start()
 
 
 # ────────────────────────────────────────
 # 텍스트 요약
 # ────────────────────────────────────────
-def _summary_text(pname: str) -> str:
-    p    = portfolios[pname]
-    df   = p["df"]
-    ts   = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
-    name = p.get("name", "포트폴리오")
-    url  = f"{public_url}/p/{pname}"
+def _summary_text(uid: int, pname: str) -> str:
+    state = _get_user_state(uid)
+    p     = state["portfolios"][pname]
+    df    = p["df"]
+    ts    = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
+    name  = p.get("name", "포트폴리오")
+    token = get_user_token(uid)
+    url   = f"{public_url}/u/{uid}/p/{pname}?t={token}"
 
     lines = [f"📊 *{name} 요약* `{ts} KST`\n"]
     valid = df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
@@ -2141,8 +1952,6 @@ def _summary_text(pname: str) -> str:
 # 커맨드 핸들러
 # ────────────────────────────────────────
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
-        return
     await update.message.reply_text(
         "📋 *사용법*\n\n"
         "명령어\n"
@@ -2157,9 +1966,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
-        return
-    url = f"{public_url}/p/{active_pname}" if active_pname else public_url
+    uid   = update.effective_user.id
+    state = _get_user_state(uid)
+    token = get_user_token(uid)
+    active = state["active_pname"]
+    url = f"{public_url}/u/{uid}/p/{active}?t={token}" if active else public_url
     await update.message.reply_text(
         f"📊 *대시보드 URL*\n\n🔗 {url}",
         parse_mode=ParseMode.MARKDOWN,
@@ -2168,8 +1979,11 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
-        return
+    uid          = update.effective_user.id
+    state        = _get_user_state(uid)
+    portfolios   = state["portfolios"]
+    active_pname = state["active_pname"]
+    token        = get_user_token(uid)
     if not portfolios:
         await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
         return
@@ -2178,7 +1992,7 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name = p.get("name", pname)
         ts   = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
         mark = "▶ " if pname == active_pname else "   "
-        url  = f"{public_url}/p/{pname}"
+        url  = f"{public_url}/u/{uid}/p/{pname}?t={token}"
         lines.append(f"{mark}*{name}* `{ts}`\n🔗 {url}")
     await update.message.reply_text(
         "\n\n".join(lines),
@@ -2188,16 +2002,18 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
-        return
-    if active_pname not in portfolios:
+    uid          = update.effective_user.id
+    state        = _get_user_state(uid)
+    active_pname = state["active_pname"]
+    if active_pname not in state["portfolios"]:
         await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
         return
     msg = await update.message.reply_text("🔄 가격 재조회 중...")
     try:
-        await asyncio.get_running_loop().run_in_executor(None, build_dashboard_for, active_pname)
-        ts  = portfolios[active_pname]["last_update"].strftime("%m/%d %H:%M")
-        url = f"{public_url}/p/{active_pname}"
+        await asyncio.get_running_loop().run_in_executor(None, build_dashboard_for, uid, active_pname)
+        ts    = state["portfolios"][active_pname]["last_update"].strftime("%m/%d %H:%M")
+        token = get_user_token(uid)
+        url   = f"{public_url}/u/{uid}/p/{active_pname}?t={token}"
         await msg.edit_text(
             f"✅ *업데이트 완료*\n\n🕐 `{ts} KST`\n🔗 {url}",
             parse_mode=ParseMode.MARKDOWN,
@@ -2207,13 +2023,14 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_owner(update):
-        return
-    if active_pname not in portfolios:
+    uid          = update.effective_user.id
+    state        = _get_user_state(uid)
+    active_pname = state["active_pname"]
+    if active_pname not in state["portfolios"]:
         await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
         return
     await update.message.reply_text(
-        _summary_text(active_pname),
+        _summary_text(uid, active_pname),
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True,
     )
@@ -2223,70 +2040,80 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # 자동 스케줄
 # ────────────────────────────────────────
 async def scheduled_send(label: str):
-    if not portfolios:
-        log.info(f"⏰ {label} — 포트폴리오 없음, 건너뜀")
+    if not all_users:
+        log.info(f"⏰ {label} — 유저 없음, 건너뜀")
         return
     log.info(f"⏰ 자동 전송 시작 ({label})")
-    bot = Bot(token=TELEGRAM_TOKEN)
-    for pname in list(portfolios.keys()):
-        p = portfolios[pname]
-        if p.get("df") is None or len(p.get("df", [])) == 0:
-            continue
-        try:
-            await asyncio.get_running_loop().run_in_executor(None, build_dashboard_for, pname)
-            text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(pname)}"
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
-            log.info(f"  → {p.get('name')} ({pname}) 전송 완료")
-        except Exception as e:
-            log.error(f"  → {pname} 전송 실패: {e}")
+    for uid, state in list(all_users.items()):
+        for pname in list(state["portfolios"].keys()):
+            p = state["portfolios"][pname]
+            if p.get("df") is None or len(p.get("df", [])) == 0:
+                continue
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, build_dashboard_for, uid, pname
+                )
+                text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(uid, pname)}"
+                await tg_bot.send_message(
+                    chat_id=uid,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True,
+                )
+                log.info(f"  → uid={uid} {p.get('name')} ({pname}) 전송 완료")
+            except Exception as e:
+                log.error(f"  → uid={uid} {pname} 전송 실패: {e}")
 
 
 async def scheduled_snapshot():
-    """가격 재조회 없이 현재 df 기준으로 모든 포트폴리오 스냅샷 저장"""
-    if not portfolios:
-        return
-    for pname, p in list(portfolios.items()):
-        df = p.get("df")
-        if df is None or len(df) == 0:
-            continue
-        try:
-            usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns else 1370.0
-            save_snapshot(pname, df, usd_krw)
-            log.info(f"  📸 자정 스냅샷 저장: {p.get('name', pname)}")
-        except Exception as e:
-            log.error(f"  ⚠️  자정 스냅샷 실패 ({pname}): {e}")
+    """가격 재조회 없이 현재 df 기준으로 모든 유저·포트폴리오 스냅샷 저장."""
+    for uid, state in list(all_users.items()):
+        for pname, p in list(state["portfolios"].items()):
+            df = p.get("df")
+            if df is None or len(df) == 0:
+                continue
+            try:
+                usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns else 1370.0
+                save_snapshot(uid, pname, df, usd_krw)
+                log.info(f"  📸 자정 스냅샷: uid={uid} {p.get('name', pname)}")
+            except Exception as e:
+                log.error(f"  ⚠️  자정 스냅샷 실패 uid={uid} {pname}: {e}")
 
 
 # ────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────
 def main():
-    global portfolios, active_pname
+    global tg_bot, public_url
 
     log.info("=" * 55)
-    log.info("  📊  포트폴리오 봇 시작 (멀티 포트폴리오)")
+    log.info("  📊  포트폴리오 봇 시작 (멀티유저)")
     log.info("=" * 55)
 
-    portfolios, active_pname = load_portfolios()
-    log.info(f"  📁 포트폴리오 {len(portfolios)}개 로드, 활성: {active_pname}")
+    if TELEGRAM_CHAT_ID:
+        state = _get_user_state(TELEGRAM_CHAT_ID)
+        log.info(f"  📁 기본 유저 포트폴리오 {len(state['portfolios'])}개 로드")
 
     threading.Thread(target=run_flask, daemon=True).start()
     log.info(f"  🖥️  Flask 서버 시작 (port {FLASK_PORT})")
 
-    start_ngrok()
+    if USE_NGROK:
+        start_ngrok()
+    elif FLASK_PUBLIC_URL:
+        public_url = FLASK_PUBLIC_URL.rstrip("/")
+        log.info(f"  🌐 공인 IP 모드: {public_url}")
+    else:
+        log.warning("  ⚠️  USE_NGROK=false이지만 FLASK_PUBLIC_URL 미설정 — 대시보드 링크가 비어 있습니다")
 
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    tg_bot = tg_app.bot
     tg_app.add_handler(CommandHandler("start",     cmd_help))
     tg_app.add_handler(CommandHandler("help",      cmd_help))
     tg_app.add_handler(CommandHandler("run",       cmd_run))
     tg_app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     tg_app.add_handler(CommandHandler("refresh",   cmd_refresh))
     tg_app.add_handler(CommandHandler("summary",   cmd_summary))
+
     scheduler = AsyncIOScheduler(timezone=KST)
     scheduler.add_job(
         scheduled_send, "cron",
