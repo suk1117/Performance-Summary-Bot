@@ -19,8 +19,5 @@ jobs:
             cd ~/portfolio
             source venv/bin/activate
             git pull origin main
-            pkill -f combined_bot.py || true
-            sleep 2
-            nohup python combined_bot.py > bot.log 2>&1 </dev/null &
-            disown
+            sudo systemctl restart portfolio-bot
             echo "✅ 배포 완료"
