@@ -352,7 +352,7 @@ def compute_nav_units(uid: int, pname: str, total_assets_krw: float) -> tuple:
         return 1000.0, 0.0
 
     units = 0.0
-    for cf in sorted(records, key=lambda x: x["date"]):
+    for cf in sorted(records, key=lambda x: (x["date"], 0 if x["type"] == "in" else 1)):
         cf_nav = cf.get("nav", 1000.0)
         if cf_nav <= 0:
             cf_nav = 1000.0
