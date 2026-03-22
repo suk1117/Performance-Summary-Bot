@@ -884,12 +884,37 @@ def build_user_html(
     if show_hist:
         hist_chart_html = (
             '<div class="card" style="margin-bottom:16px">'
-            '<div class="card-title">수익률 추이</div>'
+            '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
+            '<div class="card-title" style="margin-bottom:0">수익률 추이</div>'
+            '<div style="display:flex;gap:6px;flex-wrap:wrap">'
+            '<button id="idx-btn-KOSPI"  onclick="toggleIndex(\'KOSPI\')"  '
+            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
+            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
+            'transition:all .15s">KOSPI</button>'
+            '<button id="idx-btn-KOSDAQ" onclick="toggleIndex(\'KOSDAQ\')" '
+            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
+            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
+            'transition:all .15s">KOSDAQ</button>'
+            '<button id="idx-btn-NASDAQ" onclick="toggleIndex(\'NASDAQ\')" '
+            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
+            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
+            'transition:all .15s">NASDAQ</button>'
+            '<button id="idx-btn-SP500"  onclick="toggleIndex(\'S&P500\')" '
+            'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
+            'background:#fff;font-size:.72rem;font-weight:600;cursor:pointer;color:#64748b;'
+            'transition:all .15s">S&P500</button>'
+            '</div></div>'
             '<div style="position:relative;height:220px">'
             '<canvas id="histChart"></canvas>'
             '</div></div>'
         )
-        hist_chart_js = f"""new Chart(document.getElementById("histChart"), {{
+        hist_chart_js = f"""
+const _histStart  = {hist_dates_js}.length > 0 ? {hist_dates_js}[0] : null;
+const _idxColors  = {{ "KOSPI": "#f59e0b", "KOSDAQ": "#10b981", "NASDAQ": "#ef4444", "S&P500": "#f97316" }};
+const _idxVisible = {{ "KOSPI": false, "KOSDAQ": false, "NASDAQ": false, "S&P500": false }};
+const _idxCache   = {{}};
+
+const histChart = new Chart(document.getElementById("histChart"), {{
   type: "line",
   data: {{
     labels: {hist_dates_js},
@@ -916,6 +941,7 @@ def build_user_html(
     plugins: {{
       legend: {{ position: "top", labels: {{ boxWidth: 9, padding: 10, font: {{ size: 11 }} }} }},
       tooltip: {{
+        mode: "index", intersect: false,
         callbacks: {{
           label: function(c) {{
             var v = c.parsed.y;
@@ -929,7 +955,47 @@ def build_user_html(
       y: {{ grid: {{ color: "#f1f5f9" }}, ticks: {{ color: "#94a3b8", callback: function(v) {{ return (v >= 0 ? "+" : "") + v + "%"; }} }} }},
     }},
   }},
-}});"""
+}});
+
+function _alignToLabels(idxData, labels) {{
+  const map = {{}};
+  idxData.forEach(d => {{ map[d.date] = d.return; }});
+  return labels.map(d => map[d] != null ? map[d] : null);
+}}
+
+window.toggleIndex = async function(name) {{
+  const btn     = document.getElementById("idx-btn-" + name.replace("&", ""));
+  const color   = _idxColors[name];
+  const visible = _idxVisible[name];
+  if (visible) {{
+    _idxVisible[name] = false;
+    btn.style.background = "#fff"; btn.style.color = "#64748b"; btn.style.borderColor = "#e2e8f0";
+    const idx = histChart.data.datasets.findIndex(d => d.label === name);
+    if (idx > 0) histChart.data.datasets.splice(idx, 1);
+    histChart.update();
+    return;
+  }}
+  _idxVisible[name] = true;
+  btn.style.background = color; btn.style.color = "#fff"; btn.style.borderColor = color;
+  if (!_idxCache[name] && _histStart) {{
+    try {{
+      const r = await fetch(`/u/${{UID}}/api/index_returns?start=${{_histStart}}&t=${{TOKEN}}`);
+      const all = await r.json();
+      Object.keys(all).forEach(k => {{ _idxCache[k] = all[k]; }});
+    }} catch(e) {{
+      console.error("지수 데이터 조회 실패", e);
+      _idxVisible[name] = false;
+      btn.style.background = "#fff"; btn.style.color = "#64748b";
+      return;
+    }}
+  }}
+  const aligned = _alignToLabels(_idxCache[name] || [], histChart.data.labels);
+  histChart.data.datasets.push({{
+    label: name, data: aligned, borderColor: color, backgroundColor: "transparent",
+    tension: 0.3, fill: false, pointRadius: 0, pointHoverRadius: 5, borderWidth: 1.5, spanGaps: true,
+  }});
+  histChart.update();
+}};"""
     else:
         hist_chart_html = ""
         hist_chart_js   = ""
@@ -1821,6 +1887,36 @@ def api_refresh(uid: int, pname: str):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── 지수 비교 ──
+@app_flask.route("/u/<int:uid>/api/index_returns")
+def api_index_returns(uid: int):
+    _check_token(uid)
+    import yfinance as yf
+    start = request.args.get("start", "")
+    if not start:
+        return jsonify({})
+    tickers = {"KOSPI": "^KS11", "KOSDAQ": "^KQ11", "NASDAQ": "^IXIC", "S&P500": "^GSPC"}
+    result = {}
+    for name, ticker in tickers.items():
+        try:
+            df_idx = yf.download(ticker, start=start, progress=False, auto_adjust=True)
+            if df_idx.empty:
+                result[name] = []
+                continue
+            closes = df_idx["Close"]
+            if hasattr(closes, "squeeze"):
+                closes = closes.squeeze()
+            closes = closes.dropna()
+            base = float(closes.iloc[0])
+            result[name] = [
+                {"date": str(d.date()), "return": round((float(v) - base) / base * 100, 4)}
+                for d, v in closes.items()
+            ]
+        except Exception:
+            result[name] = []
+    return jsonify(result)
 
 
 # ── 자금 기록 ──
