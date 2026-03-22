@@ -267,10 +267,12 @@ def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
         }
 
     net_investment   = get_net_investment(uid, pname)
-    cash_krw         = max(0.0, net_investment - stock_eval_krw) if net_investment > 0 else 0.0
+    cash_krw         = max(0.0, net_investment - total_buy) if net_investment > 0 else 0.0
     total_assets     = stock_eval_krw + cash_krw
     total_return_pct = (stock_eval_krw - total_buy) / total_buy * 100 if total_buy > 0 else 0.0
     mwr = (total_assets - net_investment) / net_investment * 100 if net_investment > 0 else None
+    nav, units = compute_nav_units(uid, pname, total_assets)
+    nav_return = (nav / 1000.0 - 1) * 100
 
     history[today] = {
         "total_assets":   round(total_assets, 2),
@@ -278,6 +280,8 @@ def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
         "positions":      positions,
         "net_investment": round(net_investment, 2),
         "mwr":            round(mwr, 4) if mwr is not None else None,
+        "nav":            round(nav, 6),
+        "nav_return":     round(nav_return, 4),
     }
 
     with open(fpath, "w", encoding="utf-8") as f:
@@ -314,11 +318,17 @@ def load_cashflow(uid: int, pname: str) -> list:
 
 def add_cashflow(uid: int, pname: str, type_: str, amount: float, memo: str):
     records = load_cashflow(uid, pname)
+    history = load_history(uid, pname)
+    current_nav = 1000.0
+    if history:
+        last_date = sorted(history.keys())[-1]
+        current_nav = history[last_date].get("nav", 1000.0)
     records.append({
         "date":   date.today().isoformat(),
         "type":   type_,
         "amount": amount,
         "memo":   memo,
+        "nav":    current_nav,
     })
     save_cashflow(uid, pname, records)
 
@@ -329,6 +339,34 @@ def get_net_investment(uid: int, pname: str) -> float:
         sum(r["amount"] for r in records if r["type"] == "in")
         - sum(r["amount"] for r in records if r["type"] == "out")
     )
+
+
+def compute_nav_units(uid: int, pname: str, total_assets_krw: float) -> tuple:
+    """
+    cashflow 기록을 기반으로 현재 nav(기준가)와 units(좌수)를 계산.
+    total_assets_krw: 현재 총 평가금액(주식 + 현금), KRW 환산
+    반환: (nav, units)
+    """
+    records = load_cashflow(uid, pname)
+    if not records:
+        return 1000.0, 0.0
+
+    units = 0.0
+    for cf in sorted(records, key=lambda x: x["date"]):
+        cf_nav = cf.get("nav", 1000.0)
+        if cf_nav <= 0:
+            cf_nav = 1000.0
+        if cf["type"] == "in":
+            units += cf["amount"] / cf_nav
+        else:
+            units -= cf["amount"] / cf_nav
+
+    if units <= 0:
+        return 1000.0, 0.0
+
+    nav = total_assets_krw / units
+    return round(nav, 6), round(units, 6)
+
 
 # =======================================================
 # price_fetcher.py
@@ -583,42 +621,44 @@ def build_user_html(
     hist_dates  = sorted(hist.keys())
     hist_twr_vals = [hist[d].get("total_return") for d in hist_dates]
     hist_mwr_vals = [hist[d].get("mwr") for d in hist_dates]
+    hist_nav_vals = [hist[d].get("nav_return") for d in hist_dates]
     hist_dates_js = json.dumps(hist_dates)
     hist_twr_js   = json.dumps([round(v, 4) if v is not None else None for v in hist_twr_vals])
     hist_mwr_js   = json.dumps([round(v, 4) if v is not None else None for v in hist_mwr_vals])
+    hist_nav_js   = json.dumps([round(v, 4) if v is not None else None for v in hist_nav_vals])
     show_hist     = len(hist_dates) > 1
 
     def _period_ret(days):
         if not hist:
             return None
         sorted_dates = sorted(hist.keys())
-        cur_mwr = hist[sorted_dates[-1]].get("mwr")
-        if cur_mwr is None:
+        cur_nav = hist[sorted_dates[-1]].get("nav_return")
+        if cur_nav is None:
             return None
         target = (date.today() - timedelta(days=days)).isoformat()
         past_dates = [d for d in sorted_dates if d <= target]
         if not past_dates:
             return None
-        past_mwr = hist[past_dates[-1]].get("mwr")
-        if past_mwr is None:
+        past_nav = hist[past_dates[-1]].get("nav_return")
+        if past_nav is None:
             return None
-        return round(cur_mwr - past_mwr, 2)
+        return round((1 + cur_nav / 100) / (1 + past_nav / 100) * 100 - 100, 2)
 
     _period_labels = [("1개월", 30), ("3개월", 90), ("6개월", 180), ("1년", 365), ("전체", None)]
     def _period_ret_all():
         if not hist:
             return None
         sorted_dates = sorted(hist.keys())
-        first_mwr = None
+        first_nav = None
         for d in sorted_dates:
-            v = hist[d].get("mwr")
+            v = hist[d].get("nav_return")
             if v is not None:
-                first_mwr = v
+                first_nav = v
                 break
-        cur_mwr = hist[sorted_dates[-1]].get("mwr")
-        if cur_mwr is None or first_mwr is None:
+        cur_nav = hist[sorted_dates[-1]].get("nav_return")
+        if cur_nav is None or first_nav is None:
             return None
-        return round(cur_mwr - first_mwr, 2)
+        return round((1 + cur_nav / 100) / (1 + first_nav / 100) * 100 - 100, 2)
 
     _period_vals = []
     for _lbl, _days in _period_labels:
@@ -648,7 +688,9 @@ def build_user_html(
     _period_cells = "".join(_pret_html(lbl, val) for lbl, val in _period_vals)
     period_html = (
         '<div class="card" style="margin-bottom:16px">'
-        '<div class="card-title">기간별 수익률</div>'
+        '<div class="card-title">기간별 수익률'
+        '<span style="font-size:.72rem;font-weight:400;color:#94a3b8;margin-left:6px">NAV 기준가 방식 · 복리 계산</span>'
+        '</div>'
         f'<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:4px">'
         f'{_period_cells}'
         f'</div>'
@@ -863,6 +905,24 @@ def build_user_html(
 
     net_inv_disp = fmt_krw(net_investment) if cashflows else "—"
 
+    current_nav_return = None
+    if hist:
+        last_d = sorted(hist.keys())[-1]
+        current_nav_return = hist[last_d].get("nav_return")
+    if current_nav_return is not None:
+        nav_sign  = "+" if current_nav_return >= 0 else ""
+        nav_color = "#16a34a" if current_nav_return >= 0 else "#dc2626"
+        nav_card  = (
+            f'<div class="ov-metric">'
+            f'<div class="m-label"><span class="help-wrap">계좌 수익률<span class="help-icon">?</span>'
+            f'<span class="help-tip">입출금 타이밍을 제거한 순수 운용 성과(NAV 기준가 방식).<br>추가 입금이 많아도 수익률이 희석되지 않습니다.</span></span></div>'
+            f'<div class="m-value" style="color:{nav_color}">{nav_sign}{current_nav_return:.2f}%</div>'
+            f'<div class="m-sub">입출금 제거 기준</div>'
+            f'</div>'
+        )
+    else:
+        nav_card = ""
+
     if cashflows:
         cf_rows = ""
         for cf in reversed(cashflows):
@@ -885,7 +945,10 @@ def build_user_html(
         hist_chart_html = (
             '<div class="card" style="margin-bottom:16px">'
             '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">'
-            '<div class="card-title" style="margin-bottom:0">수익률 추이</div>'
+            '<div class="card-title" style="margin-bottom:0">수익률 추이'
+            '<span style="font-size:.72rem;font-weight:400;color:#94a3b8;margin-left:8px">'
+            '종목 수익률 = 매수금 기준 &nbsp;·&nbsp; 단순 계좌 수익률 = 입출금 포함 &nbsp;·&nbsp; 계좌 수익률 = 입출금 제거(NAV)'
+            '</span></div>'
             '<div style="display:flex;gap:6px;flex-wrap:wrap">'
             '<button id="idx-btn-KOSPI"  onclick="toggleIndex(\'KOSPI\')"  '
             'style="padding:3px 10px;border-radius:20px;border:1px solid #e2e8f0;'
@@ -920,17 +983,24 @@ const histChart = new Chart(document.getElementById("histChart"), {{
     labels: {hist_dates_js},
     datasets: [
       {{
-        label: "가중 수익률",
+        label: "종목 수익률",
         data: {hist_twr_js},
         borderColor: "#0ea5e9",
         backgroundColor: "rgba(14,165,233,.08)",
         tension: 0.3, fill: true, pointRadius: 3, borderWidth: 2,
       }},
       {{
-        label: "실제 수익률(MWR)",
+        label: "단순 계좌 수익률",
         data: {hist_mwr_js},
         borderColor: "#6366f1",
         backgroundColor: "rgba(99,102,241,.04)",
+        tension: 0.3, fill: false, pointRadius: 3, borderWidth: 2, spanGaps: true,
+      }},
+      {{
+        label: "계좌 수익률(NAV)",
+        data: {hist_nav_js},
+        borderColor: "#f59e0b",
+        backgroundColor: "rgba(245,158,11,.04)",
         tension: 0.3, fill: false, pointRadius: 3, borderWidth: 2, spanGaps: true,
       }},
     ],
@@ -1152,6 +1222,25 @@ tbody td {{ padding:12px 10px; }}
 .btn-cancel {{ background:#f1f5f9; border:none; border-radius:8px; padding:8px 18px; cursor:pointer; font-size:.85rem; font-weight:600; color:var(--secondary); }}
 .btn-save {{ background:var(--accent); border:none; border-radius:8px; padding:8px 20px; cursor:pointer; font-size:.85rem; font-weight:700; color:#fff; }}
 .btn-save:disabled {{ opacity:.6; cursor:not-allowed; }}
+.help-wrap {{ position:relative; display:inline-flex; align-items:center; gap:3px; }}
+.help-icon {{
+  display:inline-flex; align-items:center; justify-content:center;
+  width:13px; height:13px; border-radius:50%;
+  background:#cbd5e1; color:#fff; font-size:9px; font-weight:700;
+  cursor:default; line-height:1; flex-shrink:0;
+}}
+.help-tip {{
+  display:none; position:absolute; bottom:calc(100% + 6px); left:50%;
+  transform:translateX(-50%); background:#1e293b; color:#f8fafc;
+  font-size:.72rem; line-height:1.5; padding:7px 10px; border-radius:8px;
+  white-space:nowrap; z-index:200; pointer-events:none;
+  box-shadow:0 4px 12px rgba(0,0,0,.2);
+}}
+.help-tip::after {{
+  content:""; position:absolute; top:100%; left:50%; transform:translateX(-50%);
+  border:5px solid transparent; border-top-color:#1e293b;
+}}
+.help-wrap:hover .help-tip {{ display:block; }}
 </style>
 </head>
 <body>
@@ -1170,17 +1259,18 @@ tbody td {{ padding:12px 10px; }}
     </div>
     <div class="ov-metrics">
       <div class="ov-metric">
-        <div class="m-label">총 손익</div>
+        <div class="m-label"><span class="help-wrap">총 손익<span class="help-icon">?</span><span class="help-tip">현재 주식 평가금액 - 총 매수금액.<br>현금 잔액은 포함되지 않습니다.</span></span></div>
         <div class="m-value" style="color:{pnl_color}">{pnl_sign}{pnl_disp}</div>
         <div class="m-sub" style="color:{pnl_color}">{pnl_sign}{total_pnl_pct:.2f}%</div>
       </div>
+      {nav_card}
       <div class="ov-metric">
         <div class="m-label">일일 손익</div>
         <div class="m-value" style="color:{daily_color}">{daily_sign}{daily_disp}</div>
         <div class="m-sub" style="color:{daily_color}">{daily_sign}{daily_pnl_pct:.2f}%</div>
       </div>
       <div class="ov-metric">
-        <div class="m-label">가중 수익률</div>
+        <div class="m-label"><span class="help-wrap">종목 수익률<span class="help-icon">?</span><span class="help-tip">보유 종목의 매수금액 대비 평가금액 상승률.<br>현금·입출금 타이밍은 제외됩니다.</span></span></div>
         <div class="m-value" style="color:{ret_color}">{ret_sign}{total_return:.2f}%</div>
         <div class="m-sub">주식 종목 기준</div>
       </div>
@@ -2051,6 +2141,23 @@ def _summary_text(uid: int, pname: str) -> str:
 
     lines = [f"📊 *{name} 요약* `{ts} KST`\n"]
     usd_krw_s = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
+    cashflows_s  = load_cashflow(uid, pname)
+    net_inv_s    = sum(c["amount"] for c in cashflows_s if c["type"] == "in") \
+                 - sum(c["amount"] for c in cashflows_s if c["type"] == "out")
+    total_buy_s  = sum(
+        float(r["평단가"]) * (float(r["수량"]) if pd.notna(r.get("수량")) else 0.0)
+        * (usd_krw_s if str(r.get("통화", "KRW")).upper() == "USD" else 1.0)
+        for _, r in df.iterrows()
+    )
+    stock_eval_s = sum(
+        (float(r["현재가"]) if pd.notna(r.get("현재가")) else float(r["평단가"]))
+        * (float(r["수량"]) if pd.notna(r.get("수량")) else 0.0)
+        * (usd_krw_s if str(r.get("통화", "KRW")).upper() == "USD" else 1.0)
+        for _, r in df.iterrows()
+    )
+    cash_s       = max(0.0, net_inv_s - total_buy_s) if net_inv_s > 0 else 0.0
+    total_ev_s   = stock_eval_s + cash_s
+    _w_scale_s   = stock_eval_s / total_ev_s if total_ev_s > 0 else 1.0
     valid = df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
     if not valid.empty:
         buy_w = valid.apply(
@@ -2059,7 +2166,15 @@ def _summary_text(uid: int, pname: str) -> str:
         )
         total = (valid["수익률(%)"] * buy_w).sum() / buy_w.sum() if buy_w.sum() > 0 else 0.0
         emoji = "🟢" if total >= 0 else "🔴"
-        lines.append(f"{emoji} *가중 평균 수익률: {'+' if total>=0 else ''}{total:.2f}%*\n")
+        lines.append(f"{emoji} *종목 수익률: {'+' if total>=0 else ''}{total:.2f}%*\n")
+
+    history_s = load_history(uid, pname)
+    if history_s:
+        last_d = sorted(history_s.keys())[-1]
+        nav_ret = history_s[last_d].get("nav_return")
+        if nav_ret is not None:
+            nav_emoji = "🟢" if nav_ret >= 0 else "🔴"
+            lines.append(f"{nav_emoji} *계좌 수익률(NAV): {'+' if nav_ret>=0 else ''}{nav_ret:.2f}%*\n")
 
     lines.append("```")
     lines.append(f"{'종목':<10} {'비중':>5} {'수익률':>8}")
@@ -2067,7 +2182,7 @@ def _summary_text(uid: int, pname: str) -> str:
     for _, r in df.iterrows():
         ret     = r["수익률(%)"]
         ret_str = "   —  " if pd.isna(ret) else f"{'+' if ret>=0 else ''}{ret:.2f}%"
-        lines.append(f"{r['종목명']:<10} {r['비중(%)']:>4.1f}% {ret_str:>8}")
+        lines.append(f"{r['종목명']:<10} {r['비중(%)'] * _w_scale_s:>4.1f}% {ret_str:>8}")
     lines.append("```")
     lines.append(f"\n🔗 [대시보드]({url})")
     return "\n".join(lines)
