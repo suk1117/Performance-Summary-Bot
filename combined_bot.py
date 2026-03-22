@@ -1370,7 +1370,7 @@ async function refreshPrices() {{
     const res  = await fetch(`/u/${{UID}}/api/p/${{PNAME}}/refresh?t=${{TOKEN}}`, {{method:'POST', signal: ctrl.signal}});
     clearTimeout(tid);
     if (res.ok) {{ location.reload(); }}
-    else {{ const e = await res.json(); alert('가격 조회 오류: ' + e.error); }}
+    else {{ let msg = `HTTP ${{res.status}}`; try {{ const e = await res.json(); msg = e.error || msg; }} catch(_) {{}} alert('가격 조회 오류: ' + msg); }}
   }} catch(e) {{
     alert('가격 조회 오류: ' + (e.name === 'AbortError' ? '시간 초과 (120초)' : e.message));
   }} finally {{
@@ -1605,6 +1605,14 @@ _hist_check: dict = {}            # (uid, pname) -> "YYYY-MM-DD"
 
 app_flask    = Flask(__name__)
 REQUIRED_COLS = {"종목명", "국가", "평단가", "수량", "통화"}
+
+
+@app_flask.errorhandler(400)
+@app_flask.errorhandler(403)
+@app_flask.errorhandler(404)
+@app_flask.errorhandler(500)
+def _json_error(e):
+    return jsonify({"error": str(e)}), e.code
 
 
 def _get_user_state(uid: int) -> dict:
