@@ -2007,7 +2007,11 @@ from telegram.constants import ParseMode
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "여기에_텔레그램_토큰_입력")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 NGROK_TOKEN      = os.getenv("NGROK_TOKEN",       "여기에_ngrok_토큰_입력")
-FLASK_PORT       = 5050
+FLASK_PORT       = int(os.getenv("FLASK_PORT",    "5050"))
+# USE_NGROK=false → ngrok 없이 Flask 직접 노출 (GCP 등 공인 IP 서버에서 사용)
+# FLASK_PUBLIC_URL → 외부에서 접근 가능한 URL (예: http://34.xx.xx.xx:5050)
+USE_NGROK        = os.getenv("USE_NGROK", "true").lower() not in ("false", "0", "no")
+FLASK_PUBLIC_URL = os.getenv("FLASK_PUBLIC_URL", "")
 KST              = pytz.timezone("Asia/Seoul")
 # ══════════════════════════════════════════
 
@@ -2561,7 +2565,14 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
     log.info(f"  🖥️  Flask 서버 시작 (port {FLASK_PORT})")
 
-    start_ngrok()
+    if USE_NGROK:
+        start_ngrok()
+    elif FLASK_PUBLIC_URL:
+        global public_url
+        public_url = FLASK_PUBLIC_URL.rstrip("/")
+        log.info(f"  🌐 공인 IP 모드: {public_url}")
+    else:
+        log.warning("  ⚠️  USE_NGROK=false이지만 FLASK_PUBLIC_URL 미설정 — 대시보드 링크가 비어 있습니다")
 
     global tg_bot
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
