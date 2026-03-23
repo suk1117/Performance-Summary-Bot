@@ -181,15 +181,23 @@ def load_portfolios(uid: int) -> tuple[dict, str]:
     return items, active
 
 
+_DERIVED_COLS = ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"]
+
 def save_portfolios(uid: int, portfolios: dict, active_pname: str):
     raw = _raw(uid)
     raw["active"] = active_pname
     out = {}
     for pname, p in portfolios.items():
+        df = p.get("df")
+        if df is not None:
+            df_save = df.drop(columns=[c for c in _DERIVED_COLS if c in df.columns])
+            records = df_save.to_dict(orient="records")
+        else:
+            records = []
         out[pname] = {
             "name":        p.get("name", pname),
             "last_update": p["last_update"].isoformat() if p.get("last_update") else None,
-            "df":          p["df"].to_dict(orient="records") if p.get("df") is not None else [],
+            "df":          records,
         }
     raw["items"] = out
     _save_raw(uid, raw)
@@ -280,8 +288,8 @@ def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
         "positions":      positions,
         "net_investment": round(net_investment, 2),
         "mwr":            round(mwr, 4) if mwr is not None else None,
-        "nav":            round(nav, 6),
-        "nav_return":     round(nav_return, 4),
+        "nav":            None if (nav != nav) else round(nav, 6),
+        "nav_return":     None if (nav_return != nav_return) else round(nav_return, 4),
     }
 
     with open(fpath, "w", encoding="utf-8") as f:
@@ -1772,6 +1780,9 @@ REQUIRED_COLS = {"종목명", "국가", "평단가", "수량", "통화"}
 @app_flask.errorhandler(404)
 @app_flask.errorhandler(500)
 def _json_error(e):
+    if getattr(e, "code", 500) == 500:
+        import traceback as _tb
+        log.error("Flask 500 오류:\n" + _tb.format_exc())
     return jsonify({"error": str(e)}), e.code
 
 
@@ -2326,6 +2337,24 @@ async def scheduled_snapshot():
 def main():
     global tg_bot, public_url
 
+    # ── 중복 실행 방지 (파일 잠금) ──
+    _lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot.lock")
+    try:
+        if sys.platform == "win32":
+            import msvcrt as _msvcrt
+            _lock_fd = open(_lock_path, "wb")
+            _msvcrt.locking(_lock_fd.fileno(), _msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl as _fcntl
+            _lock_fd = open(_lock_path, "wb")
+            _fcntl.flock(_lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except OSError:
+        log.error(
+            "❌ 봇이 이미 실행 중입니다. "
+            "기존 프로세스를 종료한 후 다시 실행하세요."
+        )
+        sys.exit(1)
+
     log.info("=" * 55)
     log.info("  📊  포트폴리오 봇 시작 (멀티유저)")
     log.info("=" * 55)
@@ -2353,6 +2382,24 @@ def main():
     tg_app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     tg_app.add_handler(CommandHandler("refresh",   cmd_refresh))
     tg_app.add_handler(CommandHandler("summary",   cmd_summary))
+
+    async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        from telegram.error import Conflict, NetworkError
+        err = context.error
+        if isinstance(err, Conflict):
+            log.warning("⚠️  Telegram Conflict: 다른 봇 인스턴스가 실행 중입니다. 기존 프로세스를 종료하세요.")
+            return
+        if isinstance(err, NetworkError):
+            log.debug(f"네트워크 오류 (재시도 예정): {err}")
+            return
+        log.error(f"봇 오류: {err}", exc_info=context.error)
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text(f"❌ 오류가 발생했습니다: {err}")
+            except Exception:
+                pass
+
+    tg_app.add_error_handler(_error_handler)
 
     scheduler = AsyncIOScheduler(timezone=KST)
     scheduler.add_job(
