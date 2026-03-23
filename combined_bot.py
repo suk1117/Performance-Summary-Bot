@@ -10,6 +10,7 @@ import time as _time
 # =======================================================
 import json
 import os
+import tempfile
 import secrets as _secrets
 from datetime import datetime, date
 import pandas as pd
@@ -54,8 +55,13 @@ def _raw(uid: int) -> dict:
         return {"active": "", "next_id": 1, "items": {}}
 
 def _save_raw(uid: int, data: dict):
-    with open(_portfolios_file(uid), "w", encoding="utf-8") as f:
+    fpath = _portfolios_file(uid)
+    dirpath = os.path.dirname(fpath)
+    os.makedirs(dirpath, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dirpath, delete=False, suffix=".tmp") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        tmp_path = f.name
+    os.replace(tmp_path, fpath)
 
 def _df_from_records(records: list) -> pd.DataFrame:
     df = pd.DataFrame(records) if records else pd.DataFrame(columns=_EMPTY_COLS)
@@ -277,8 +283,11 @@ def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
         "nav_return":     None if (nav_return != nav_return) else round(nav_return, 4),
     }
 
-    with open(fpath, "w", encoding="utf-8") as f:
+    dirpath = os.path.dirname(fpath)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dirpath, delete=False, suffix=".tmp") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
+        tmp_path = f.name
+    os.replace(tmp_path, fpath)
 
 
 def load_history(uid: int, pname: str) -> dict:
@@ -294,8 +303,12 @@ def load_history(uid: int, pname: str) -> dict:
 
 # ─── 자금 기록 ────────────────────────────────────────
 def save_cashflow(uid: int, pname: str, records: list):
-    with open(_cashflow_path(uid, pname), "w", encoding="utf-8") as f:
+    fpath = _cashflow_path(uid, pname)
+    dirpath = os.path.dirname(fpath)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dirpath, delete=False, suffix=".tmp") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
+        tmp_path = f.name
+    os.replace(tmp_path, fpath)
 
 
 def load_cashflow(uid: int, pname: str) -> list:
@@ -2337,21 +2350,20 @@ def api_add_stock(uid: int, pname: str):
         avg      = float(data["평단가"])
         currency = "USD" if country == "US" else "KRW"
 
-        df = state["portfolios"][pname]["df"].copy()
-        if "비중(%)" not in df.columns:
-            df["비중(%)"] = 0.0
-        if name in df["종목명"].values:
-            df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
-                [country, avg, qty, currency]
-        else:
-            new_row = pd.DataFrame([{
-                "종목명": name, "국가": country,
-                "비중(%)": 0.0, "평단가": avg, "수량": qty, "통화": currency,
-            }])
-            df = pd.concat([df, new_row], ignore_index=True)
-
-        drop_cols = [c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in df.columns]
         with _users_lock:
+            df = state["portfolios"][pname]["df"].copy()
+            if "비중(%)" not in df.columns:
+                df["비중(%)"] = 0.0
+            if name in df["종목명"].values:
+                df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
+                    [country, avg, qty, currency]
+            else:
+                new_row = pd.DataFrame([{
+                    "종목명": name, "국가": country,
+                    "비중(%)": 0.0, "평단가": avg, "수량": qty, "통화": currency,
+                }])
+                df = pd.concat([df, new_row], ignore_index=True)
+            drop_cols = [c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in df.columns]
             state["portfolios"][pname]["df"] = df.drop(columns=drop_cols)
             save_portfolios(uid, state["portfolios"], state["active_pname"])
         return jsonify({"ok": True})
