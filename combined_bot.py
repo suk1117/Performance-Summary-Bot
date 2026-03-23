@@ -46,22 +46,27 @@ def _cashflow_path(uid: int, pname: str) -> str:
 
 def _raw(uid: int) -> dict:
     fpath = _portfolios_file(uid)
-    if not os.path.exists(fpath):
-        return {"active": "", "next_id": 1, "items": {}}
-    try:
-        with open(fpath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"active": "", "next_id": 1, "items": {}}
+    lock  = _get_portfolios_file_lock(uid)
+    with lock:
+        if not os.path.exists(fpath):
+            return {"active": "", "next_id": 1, "items": {}}
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"active": "", "next_id": 1, "items": {}}
 
 def _save_raw(uid: int, data: dict):
     fpath = _portfolios_file(uid)
     dirpath = os.path.dirname(fpath)
     os.makedirs(dirpath, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dirpath, delete=False, suffix=".tmp") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
-        tmp_path = f.name
-    os.replace(tmp_path, fpath)
+    lock = _get_portfolios_file_lock(uid)
+    with lock:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8",
+                                         dir=dirpath, delete=False, suffix=".tmp") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+            tmp_path = f.name
+        os.replace(tmp_path, fpath)
 
 def _df_from_records(records: list) -> pd.DataFrame:
     df = pd.DataFrame(records) if records else pd.DataFrame(columns=_EMPTY_COLS)
@@ -74,12 +79,25 @@ def _df_from_records(records: list) -> pd.DataFrame:
 # ─── 토큰 관리 ────────────────────────────────────────
 def get_user_token(uid: int) -> str:
     """uid별 URL 토큰 반환. 없으면 생성 후 저장."""
-    raw = _raw(uid)
-    token = raw.get("token", "")
-    if not token:
-        token = _secrets.token_urlsafe(16)
-        raw["token"] = token
-        _save_raw(uid, raw)
+    fpath = _portfolios_file(uid)
+    lock  = _get_portfolios_file_lock(uid)
+    with lock:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {"active": "", "next_id": 1, "items": {}}
+        token = raw.get("token", "")
+        if not token:
+            token = _secrets.token_urlsafe(16)
+            raw["token"] = token
+            dirpath = os.path.dirname(fpath)
+            os.makedirs(dirpath, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8",
+                                              dir=dirpath, delete=False, suffix=".tmp") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2, default=str)
+                tmp_path = f.name
+            os.replace(tmp_path, fpath)
     return token
 
 
@@ -175,65 +193,86 @@ def load_portfolios(uid: int) -> tuple[dict, str]:
 _DERIVED_COLS = ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"]
 
 def save_portfolios(uid: int, portfolios: dict, active_pname: str):
-    raw = _raw(uid)
-    raw["active"] = active_pname
-    out = {}
-    for pname, p in portfolios.items():
-        df = p.get("df")
-        if df is not None:
-            df_save = df.drop(columns=[c for c in _DERIVED_COLS if c in df.columns])
-            records = df_save.to_dict(orient="records")
-        else:
-            records = []
-        out[pname] = {
-            "name":        p.get("name", pname),
-            "last_update": p["last_update"].isoformat() if p.get("last_update") else None,
-            "df":          records,
-        }
-    raw["items"] = out
-    _save_raw(uid, raw)
+    fpath   = _portfolios_file(uid)
+    dirpath = os.path.dirname(fpath)
+    lock    = _get_portfolios_file_lock(uid)
+    with lock:
+        # 최신 디스크 상태 읽기 (next_id, token 등 보존)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {"active": "", "next_id": 1, "items": {}}
+        raw["active"] = active_pname
+        out = {}
+        for pname, p in portfolios.items():
+            df = p.get("df")
+            if df is not None:
+                df_save = df.drop(columns=[c for c in _DERIVED_COLS if c in df.columns])
+                records = df_save.to_dict(orient="records")
+            else:
+                records = []
+            out[pname] = {
+                "name":        p.get("name", pname),
+                "last_update": p["last_update"].isoformat() if p.get("last_update") else None,
+                "df":          records,
+            }
+        raw["items"] = out
+        os.makedirs(dirpath, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8",
+                                          dir=dirpath, delete=False, suffix=".tmp") as tf:
+            json.dump(raw, tf, ensure_ascii=False, indent=2, default=str)
+            tmp_path = tf.name
+        os.replace(tmp_path, fpath)
 
 
 def create_portfolio(uid: int, name: str) -> str:
-    raw = _raw(uid)
-    next_id = raw.get("next_id", 1)
-    pname   = f"p{next_id}"
-    raw["next_id"] = next_id + 1
-    if "items" not in raw:
-        raw["items"] = {}
-    raw["items"][pname] = {"name": name, "last_update": None, "df": []}
-    _save_raw(uid, raw)
+    """pname을 생성해 반환. 실제 저장은 호출자가 save_portfolios로 처리."""
+    fpath = _portfolios_file(uid)
+    lock  = _get_portfolios_file_lock(uid)
+    with lock:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {"active": "", "next_id": 1, "items": {}}
+        next_id = raw.get("next_id", 1)
+        pname   = f"p{next_id}"
+        raw["next_id"] = next_id + 1
+        dirpath = os.path.dirname(fpath)
+        os.makedirs(dirpath, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8",
+                                          dir=dirpath, delete=False, suffix=".tmp") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2, default=str)
+            tmp_path = f.name
+        os.replace(tmp_path, fpath)
     return pname
 
 
-def rename_portfolio(uid: int, pname: str, new_name: str):
-    raw = _raw(uid)
-    if pname in raw.get("items", {}):
-        raw["items"][pname]["name"] = new_name
-        _save_raw(uid, raw)
-
-
-def delete_portfolio(uid: int, pname: str) -> str:
-    raw = _raw(uid)
-    items = raw.get("items", {})
-    if pname in items:
-        del items[pname]
-    raw["items"] = items
+def delete_portfolio(uid: int, pname: str):
+    """history·cashflow 파일만 삭제. items 저장은 호출자가 save_portfolios로 처리."""
     for path in [_history_path(uid, pname), _cashflow_path(uid, pname)]:
         if os.path.exists(path):
             try:
                 os.remove(path)
             except Exception:
                 pass
-    if raw.get("active") == pname:
-        remaining = list(items.keys())
-        raw["active"] = remaining[0] if remaining else ""
-    _save_raw(uid, raw)
-    return raw.get("active", "")
+    # cashflow 락 정리
+    key = (uid, pname)
+    with _cashflow_locks_lock:
+        _cashflow_locks.pop(key, None)
+    # history 락 정리
+    with _history_locks_lock:
+        _history_locks.pop(key, None)
 
 
 # ─── 히스토리 스냅샷 ──────────────────────────────────
 def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
+    lock = _get_history_lock(uid, pname)
+    with lock:
+        _save_snapshot_inner(uid, pname, df, usd_krw)
+
+def _save_snapshot_inner(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
     fpath   = _history_path(uid, pname)
     history = {}
     if os.path.exists(fpath):
@@ -323,20 +362,22 @@ def load_cashflow(uid: int, pname: str) -> list:
 
 
 def add_cashflow(uid: int, pname: str, type_: str, amount: float, memo: str):
-    records = load_cashflow(uid, pname)
-    history = load_history(uid, pname)
-    current_nav = 1000.0
-    if history:
-        last_date = sorted(history.keys())[-1]
-        current_nav = history[last_date].get("nav", 1000.0)
-    records.append({
-        "date":   date.today().isoformat(),
-        "type":   type_,
-        "amount": amount,
-        "memo":   memo,
-        "nav":    current_nav,
-    })
-    save_cashflow(uid, pname, records)
+    lock = _get_cashflow_lock(uid, pname)
+    with lock:
+        records = load_cashflow(uid, pname)
+        history = load_history(uid, pname)
+        current_nav = 1000.0
+        if history:
+            last_date = sorted(history.keys())[-1]
+            current_nav = history[last_date].get("nav", 1000.0)
+        records.append({
+            "date":   date.today().isoformat(),
+            "type":   type_,
+            "amount": amount,
+            "memo":   memo,
+            "nav":    current_nav,
+        })
+        save_cashflow(uid, pname, records)
 
 
 def get_net_investment(uid: int, pname: str) -> float:
@@ -2158,6 +2199,38 @@ _build_lock  = threading.Lock()   # _building / _hist_check 접근용
 _building:   set  = set()         # (uid, pname) 튜플
 _hist_check: dict = {}            # (uid, pname) -> "YYYY-MM-DD"
 
+# ── cashflow 파일별 락 ──
+_cashflow_locks: dict = {}              # {(uid, pname): threading.Lock()}
+_cashflow_locks_lock = threading.Lock()  # _cashflow_locks 딕셔너리 접근용
+
+def _get_cashflow_lock(uid: int, pname: str) -> threading.Lock:
+    key = (uid, pname)
+    with _cashflow_locks_lock:
+        if key not in _cashflow_locks:
+            _cashflow_locks[key] = threading.Lock()
+        return _cashflow_locks[key]
+
+# ── history 파일별 락 ──
+_history_locks: dict = {}
+_history_locks_lock = threading.Lock()
+
+def _get_history_lock(uid: int, pname: str) -> threading.Lock:
+    key = (uid, pname)
+    with _history_locks_lock:
+        if key not in _history_locks:
+            _history_locks[key] = threading.Lock()
+        return _history_locks[key]
+
+# ── portfolios.json uid별 파일 락 ──
+_portfolios_file_locks: dict = {}
+_portfolios_file_locks_lock = threading.Lock()
+
+def _get_portfolios_file_lock(uid: int) -> threading.Lock:
+    with _portfolios_file_locks_lock:
+        if uid not in _portfolios_file_locks:
+            _portfolios_file_locks[uid] = threading.Lock()
+        return _portfolios_file_locks[uid]
+
 app_flask    = Flask(__name__)
 REQUIRED_COLS = {"종목명", "국가", "평단가", "수량", "통화"}
 
@@ -2174,11 +2247,13 @@ def _json_error(e):
 
 
 def _get_user_state(uid: int) -> dict:
-    """uid의 상태 반환. 없으면 디스크에서 로드 (double-checked locking)."""
+    """uid의 상태 반환. 없으면 디스크에서 로드."""
     if uid not in all_users:
+        # 락 밖에서 미리 로드 — 중복 로드 가능하지만 결과 동일하므로 안전
+        portfolios, active_pname = load_portfolios(uid)
         with _users_lock:
+            # double-check: 다른 스레드가 먼저 로드했을 수 있음
             if uid not in all_users:
-                portfolios, active_pname = load_portfolios(uid)
                 all_users[uid] = {"portfolios": portfolios, "active_pname": active_pname}
     return all_users[uid]
 
@@ -2283,12 +2358,14 @@ def api_create_portfolio(uid: int):
     name  = str(data.get("name", "")).strip()
     if not name:
         return jsonify({"error": "이름을 입력하세요"}), 400
-    pname = create_portfolio(uid, name)
-    state["portfolios"][pname] = {
-        "name":        name,
-        "last_update": None,
-        "df":          pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
-    }
+    with _users_lock:
+        pname = create_portfolio(uid, name)   # next_id 채번 (락 안에서 직렬화)
+        state["portfolios"][pname] = {
+            "name":        name,
+            "last_update": None,
+            "df":          pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
+        }
+        save_portfolios(uid, state["portfolios"], state["active_pname"])
     return jsonify({"ok": True, "pname": pname})
 
 
@@ -2304,7 +2381,7 @@ def api_rename_portfolio(uid: int, pname: str):
         return jsonify({"error": "이름을 입력하세요"}), 400
     with _users_lock:
         state["portfolios"][pname]["name"] = name
-        rename_portfolio(uid, pname, name)
+        save_portfolios(uid, state["portfolios"], state["active_pname"])
     return jsonify({"ok": True})
 
 
@@ -2319,10 +2396,15 @@ def api_delete_portfolio(uid: int, pname: str):
         return jsonify({"error": "마지막 포트폴리오는 삭제할 수 없습니다"}), 400
     with _users_lock:
         del portfolios[pname]
-        new_active = delete_portfolio(uid, pname)
-        if not new_active or new_active not in portfolios:
+        delete_portfolio(uid, pname)          # 파일 삭제만
+        if not portfolios:
+            new_active = ""
+        elif state["active_pname"] not in portfolios:
             new_active = next(iter(portfolios))
+        else:
+            new_active = state["active_pname"]
         state["active_pname"] = new_active
+        save_portfolios(uid, portfolios, new_active)   # 인메모리로 디스크 저장
     token = get_user_token(uid)
     return jsonify({"ok": True, "redirect": f"/u/{uid}/p/{new_active}?t={token}"})
 
@@ -2332,11 +2414,6 @@ def api_delete_portfolio(uid: int, pname: str):
 def api_add_stock(uid: int, pname: str):
     _check_token(uid)
     state = _get_user_state(uid)
-    if pname not in state["portfolios"]:
-        state["portfolios"][pname] = {
-            "name": pname, "last_update": None,
-            "df": pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
-        }
     data = request.get_json()
     try:
         name     = str(data["종목명"]).strip()
@@ -2346,6 +2423,11 @@ def api_add_stock(uid: int, pname: str):
         currency = "USD" if country == "US" else "KRW"
 
         with _users_lock:
+            if pname not in state["portfolios"]:
+                state["portfolios"][pname] = {
+                    "name": pname, "last_update": None,
+                    "df": pd.DataFrame(columns=["종목명", "국가", "비중(%)", "평단가", "수량", "통화"]),
+                }
             df = state["portfolios"][pname]["df"].copy()
             if "비중(%)" not in df.columns:
                 df["비중(%)"] = 0.0
@@ -2748,9 +2830,22 @@ async def scheduled_send(label: str):
             if p.get("df") is None or len(p.get("df", [])) == 0:
                 continue
             try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, build_dashboard_for, uid, pname
-                )
+                key = (uid, pname)
+                already_building = False
+                with _build_lock:
+                    already_building = key in _building
+
+                if already_building:
+                    # 빌드 중이면 최대 30초 대기
+                    for _ in range(30):
+                        await asyncio.sleep(1)
+                        with _build_lock:
+                            if key not in _building:
+                                break
+                else:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, build_dashboard_for, uid, pname
+                    )
                 text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(uid, pname)}"
                 await tg_bot.send_message(
                     chat_id=uid,
@@ -2808,9 +2903,22 @@ def main():
     log.info("  📊  포트폴리오 봇 시작 (멀티유저)")
     log.info("=" * 55)
 
-    if TELEGRAM_CHAT_ID:
-        state = _get_user_state(TELEGRAM_CHAT_ID)
-        log.info(f"  📁 기본 유저 포트폴리오 {len(state['portfolios'])}개 로드")
+    # 디스크에 저장된 모든 유저 로드
+    _loaded = 0
+    if os.path.isdir(DATA_DIR):
+        for _entry in os.scandir(DATA_DIR):
+            if _entry.is_dir() and _entry.name.startswith("user_"):
+                try:
+                    _uid = int(_entry.name.split("_", 1)[1])
+                    _get_user_state(_uid)
+                    _loaded += 1
+                except (ValueError, Exception):
+                    pass
+    # TELEGRAM_CHAT_ID가 위에서 로드 안 됐으면 추가 로드
+    if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID not in all_users:
+        _get_user_state(TELEGRAM_CHAT_ID)
+        _loaded += 1
+    log.info(f"  📁 전체 유저 {_loaded}명 포트폴리오 로드 완료")
 
     threading.Thread(target=run_flask, daemon=True).start()
     log.info(f"  🖥️  Flask 서버 시작 (port {FLASK_PORT})")
