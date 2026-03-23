@@ -3,6 +3,7 @@ combined_bot.py - 전체 포트폴리오 봇 (단일 파일) - 멀티유저
 storage + price_fetcher + html_builder + bot 통합
 """
 from __future__ import annotations
+import time as _time
 
 # =======================================================
 # storage.py
@@ -88,20 +89,12 @@ def _migrate(uid: int):
     if os.path.exists(old_portfolios):
         try:
             shutil.copy2(old_portfolios, dst)
-            migrated = [old_portfolios]
             for fname in os.listdir(DATA_DIR):
                 if fname.startswith("history_") or fname.startswith("cashflow_"):
                     src = os.path.join(DATA_DIR, fname)
                     d   = os.path.join(_user_dir(uid), fname)
                     if not os.path.exists(d):
                         shutil.copy2(src, d)
-                    migrated.append(src)
-            # 마이그레이션 완료 후 구버전 파일 삭제 (다른 유저에게 복사되지 않도록)
-            for f in migrated:
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
             print(f"✅ 기존 데이터 → data/user_{uid}/ 마이그레이션 완료")
         except Exception as e:
             print(f"⚠️  마이그레이션 오류: {e}")
@@ -126,7 +119,6 @@ def _migrate(uid: int):
             },
         }
         _save_raw(uid, raw)
-        migrated = [old_file]
         for old_name, new_name in [
             ("cashflow.json", f"cashflow_{pname}.json"),
             ("history.json",  f"history_{pname}.json"),
@@ -135,13 +127,6 @@ def _migrate(uid: int):
             d   = os.path.join(_user_dir(uid), new_name)
             if os.path.exists(src) and not os.path.exists(d):
                 shutil.copy2(src, d)
-                migrated.append(src)
-        # 마이그레이션 완료 후 구버전 파일 삭제
-        for f in migrated:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
         print(f"✅ portfolio.json → data/user_{uid}/ 마이그레이션 완료")
     except Exception as e:
         print(f"⚠️  마이그레이션 오류: {e}")
@@ -376,6 +361,36 @@ def compute_nav_units(uid: int, pname: str, total_assets_krw: float) -> tuple:
     return round(nav, 6), round(units, 6)
 
 
+def compute_combined_nav(uid: int, pnames: list, total_assets_krw: float) -> tuple:
+    """
+    여러 포트폴리오의 cashflow를 병합해 통합 NAV를 계산.
+    모든 cashflow를 날짜순 병합 후 단일 풀로 처리.
+    반환: (nav, units)
+    """
+    all_records = []
+    for pname in pnames:
+        all_records.extend(load_cashflow(uid, pname))
+
+    if not all_records:
+        return 1000.0, 0.0
+
+    units = 0.0
+    for cf in sorted(all_records, key=lambda x: (x["date"], 0 if x["type"] == "in" else 1)):
+        cf_nav = cf.get("nav", 1000.0)
+        if cf_nav <= 0:
+            cf_nav = 1000.0
+        if cf["type"] == "in":
+            units += cf["amount"] / cf_nav
+        else:
+            units -= cf["amount"] / cf_nav
+
+    if units <= 0:
+        return 1000.0, 0.0
+
+    nav = total_assets_krw / units
+    return round(nav, 6), round(units, 6)
+
+
 # =======================================================
 # price_fetcher.py
 # =======================================================
@@ -395,13 +410,19 @@ HEADERS = {
     "Referer": "https://finance.naver.com/",
 }
 
-_kr_ticker_cache: dict[str, str] = {}
+_kr_ticker_cache: dict[str, tuple[str, float]] = {}  # {name: (code, timestamp)}
+_KR_CACHE_TTL  = 60 * 60 * 24   # 24시간
+_KR_CACHE_MAX  = 500             # 최대 항목 수
 _us_exchange_cache: dict[str, str] = {}
 
 
 def _search_kr_ticker(name: str) -> str | None:
     if name in _kr_ticker_cache:
-        return _kr_ticker_cache[name]
+        code, ts = _kr_ticker_cache[name]
+        if _time.time() - ts < _KR_CACHE_TTL:
+            return code
+        else:
+            del _kr_ticker_cache[name]
     try:
         url = "https://ac.stock.naver.com/ac"
         params = {"q": name, "q_enc": "UTF-8", "target": "stock,index,marketindicator"}
@@ -409,18 +430,21 @@ def _search_kr_ticker(name: str) -> str | None:
         r.raise_for_status()
         data = r.json()
         items = data.get("items", [])
+        def _cache_write(code: str) -> str:
+            if len(_kr_ticker_cache) >= _KR_CACHE_MAX:
+                _kr_ticker_cache.pop(next(iter(_kr_ticker_cache)))
+            _kr_ticker_cache[name] = (code, _time.time())
+            return code
         for item in items:
             if item.get("name") == name and item.get("nationCode") == "KOR":
                 code = item["code"]
-                _kr_ticker_cache[name] = code
                 log.info(f"티커 검색: {name} → {code}")
-                return code
+                return _cache_write(code)
         for item in items:
             if item.get("nationCode") == "KOR":
                 code = item["code"]
-                _kr_ticker_cache[name] = code
                 log.info(f"티커 검색: {name} → {code} (첫 번째 결과)")
-                return code
+                return _cache_write(code)
     except Exception as e:
         log.warning(f"티커 검색 실패 ({name}): {e}")
     return None
@@ -565,6 +589,7 @@ def fetch_prices(df: pd.DataFrame) -> pd.DataFrame:
 import json
 import pandas as pd
 from datetime import datetime, date, timedelta
+from html import escape
 
 
 def _build_portfolio_tabs(
@@ -576,8 +601,13 @@ def _build_portfolio_tabs(
     if not all_portfolios:
         return ""
     tabs = ""
+    if len(all_portfolios) > 1:
+        if current_pname == "all":
+            tabs += '<span class="tab active" style="display:inline-flex;align-items:center;cursor:default">전체</span>'
+        else:
+            tabs += f'<a href="/u/{uid}/p/all?t={token}" class="tab">전체</a>'
     for pname, p in all_portfolios.items():
-        name = p.get("name", pname)
+        name = escape(p.get("name", pname))
         name_esc = name.replace("'", "\\'")
         if pname == current_pname:
             del_btn = ""
@@ -605,6 +635,14 @@ def _build_portfolio_tabs(
         'font-family:inherit;flex-shrink:0">＋</button>'
     )
     return tabs
+
+
+def fmt_krw(v: float) -> str:
+    if abs(v) >= 1e8:
+        return f"₩{v/1e8:,.2f}억"
+    if abs(v) >= 1e4:
+        return f"₩{v/1e4:,.0f}만"
+    return f"₩{v:,.0f}"
 
 
 def build_user_html(
@@ -748,7 +786,7 @@ def build_user_html(
             [_w_chart, pd.DataFrame([{"종목명": "현금", "비중(%)": cash_wpct}])],
             ignore_index=True,
         )
-    wl = json.dumps(_w_chart["종목명"].tolist(), ensure_ascii=False)
+    wl = json.dumps([escape(str(n)) for n in _w_chart["종목명"].tolist()], ensure_ascii=False)
     wd = json.dumps([round(v, 2) for v in _w_chart["비중(%)"].tolist()])
     wp = json.dumps([
         PALETTE[name_to_idx[n] % len(PALETTE)] if n in name_to_idx else "#94a3b8"
@@ -778,7 +816,7 @@ def build_user_html(
         df[df["수익률(%)"].notna() & (df["국가"] != "현금")]
         .sort_values("수익률(%)", ascending=True)
     )
-    rl = json.dumps(ret_df["종목명"].tolist(), ensure_ascii=False)
+    rl = json.dumps([escape(str(n)) for n in ret_df["종목명"].tolist()], ensure_ascii=False)
     rd = json.dumps(ret_df["수익률(%)"].tolist())
     rc = json.dumps([PALETTE[name_to_idx.get(n, 0) % len(PALETTE)] for n in ret_df["종목명"].tolist()])
     ret_count    = len(ret_df)
@@ -797,8 +835,8 @@ def build_user_html(
         currency   = str(r["통화"]).upper()
         flag       = {"KR": "🇰🇷 한국", "US": "🇺🇸 미국", "현금": "💵 현금"}.get(r["국가"], f"🌐 {r['국가']}")
         color      = name_to_color.get(r["종목명"], "#64748b")
-        name       = r["종목명"]
-        initial    = name[0].upper()
+        name       = escape(r["종목명"])
+        initial    = escape(str(r["종목명"])[0].upper())
 
         if pd.isna(ret_val):
             ret_str, ret_col = "—", "#94a3b8"
@@ -888,13 +926,6 @@ def build_user_html(
         prev_price   = float(cp) / (1 + float(chg) / 100)
         daily_pnl   += (float(cp) - prev_price) * qty * mult
     daily_pnl_pct = (daily_pnl / stock_eval_krw * 100) if stock_eval_krw > 0 else 0.0
-
-    def fmt_krw(v: float) -> str:
-        if abs(v) >= 1e8:
-            return f"₩{v/1e8:,.2f}억"
-        if abs(v) >= 1e4:
-            return f"₩{v/1e4:,.0f}만"
-        return f"₩{v:,.0f}"
 
     if show_cash:
         table_rows += (
@@ -1087,7 +1118,7 @@ window.toggleIndex = async function(name) {{
     daily_color    = "#16a34a" if daily_pnl >= 0 else "#dc2626"
     ret_sign   = "+" if total_return >= 0 else ""
     ret_color  = "#16a34a" if total_return >= 0 else "#dc2626"
-    title_name = display_name or "포트폴리오"
+    title_name = escape(display_name or "포트폴리오")
     action_th  = "<th></th>"
     add_btn    = (
         '<div style="display:flex;gap:8px;align-items:center">'
@@ -1714,6 +1745,354 @@ try {{
 def build_html(df: pd.DataFrame) -> str:
     return build_user_html(df)
 
+
+def build_combined_html(uid: int, token: str, all_portfolios: dict) -> str:
+    today_str = datetime.now().strftime("%Y.%m.%d %H:%M")
+    pnames    = list(all_portfolios.keys())
+
+    PALETTE = [
+        "#0ea5e9","#8b5cf6","#f59e0b","#ef4444",
+        "#10b981","#f97316","#06b6d4","#84cc16","#ec4899","#6366f1",
+    ]
+
+    # ── 포트폴리오별 집계 ──
+    combined_stock_eval = 0.0
+    combined_total_buy  = 0.0
+    combined_net_inv    = 0.0
+    portfolio_stats     = []
+
+    for pname, p in all_portfolios.items():
+        cashflows = load_cashflow(uid, pname)
+        net_inv   = (sum(c["amount"] for c in cashflows if c["type"] == "in")
+                   - sum(c["amount"] for c in cashflows if c["type"] == "out"))
+        combined_net_inv += net_inv
+
+        df = p.get("df")
+        if df is None or len(df) == 0:
+            if net_inv > 0:
+                portfolio_stats.append({
+                    "pname":    pname,
+                    "name":     escape(p.get("name", pname)),
+                    "total_ev": net_inv,
+                    "pnl_pct":  0.0,
+                    "nav_ret":  None,
+                    "ts":       "—",
+                    "count":    0,
+                })
+            continue
+
+        usd_krw_p = 1370.0
+        if "USD_KRW" in df.columns and len(df) > 0:
+            usd_krw_p = float(df["USD_KRW"].iloc[0])
+
+        s_eval = 0.0
+        t_buy  = 0.0
+        for _, r in df.iterrows():
+            mult  = usd_krw_p if str(r.get("통화", "KRW")).upper() == "USD" else 1.0
+            qty   = float(r["수량"]) if pd.notna(r.get("수량")) else 0.0
+            avg   = float(r["평단가"])
+            cur   = float(r["현재가"]) if pd.notna(r.get("현재가")) else avg
+            s_eval += cur * qty * mult
+            t_buy  += avg * qty * mult
+
+        cash_p     = max(0.0, net_inv - t_buy) if net_inv > 0 else 0.0
+        total_ev_p = s_eval + cash_p
+        pnl_pct_p  = (s_eval - t_buy) / t_buy * 100 if t_buy > 0 else 0.0
+
+        hist_p    = load_history(uid, pname)
+        nav_ret_p = None
+        if hist_p:
+            last_d    = sorted(hist_p.keys())[-1]
+            nav_ret_p = hist_p[last_d].get("nav_return")
+
+        combined_stock_eval += s_eval
+        combined_total_buy  += t_buy
+        portfolio_stats.append({
+            "pname":    pname,
+            "name":     escape(p.get("name", pname)),
+            "total_ev": total_ev_p,
+            "pnl_pct":  pnl_pct_p,
+            "nav_ret":  nav_ret_p,
+            "ts":       p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—",
+            "count":    len(df),
+        })
+
+    # ── 통합 수치 ──
+    combined_cash    = max(0.0, combined_net_inv - combined_total_buy) if combined_net_inv > 0 else 0.0
+    combined_total   = combined_stock_eval + combined_cash
+    combined_pnl     = combined_stock_eval - combined_total_buy
+    combined_pnl_pct = combined_pnl / combined_total_buy * 100 if combined_total_buy > 0 else 0.0
+    combined_nav, _  = compute_combined_nav(uid, pnames, combined_total)
+    combined_nav_ret = (combined_nav / 1000.0 - 1) * 100
+
+    pnl_sign  = "+" if combined_pnl >= 0 else ""
+    pnl_color = "#16a34a" if combined_pnl >= 0 else "#dc2626"
+    nav_sign  = "+" if combined_nav_ret >= 0 else ""
+    nav_color = "#16a34a" if combined_nav_ret >= 0 else "#dc2626"
+    inv_disp  = fmt_krw(combined_net_inv) if combined_net_inv > 0 else "—"
+
+    # ── 탭 / 파이차트 데이터 ──
+    portfolio_tabs = _build_portfolio_tabs(all_portfolios, "all", uid=uid, token=token)
+    pie_labels = json.dumps([ps["name"] for ps in portfolio_stats], ensure_ascii=False)
+    pie_data   = json.dumps([
+        round(ps["total_ev"] / combined_total * 100, 2) if combined_total > 0 else 0
+        for ps in portfolio_stats
+    ])
+    pie_colors = json.dumps([PALETTE[i % len(PALETTE)] for i in range(len(portfolio_stats))])
+
+    # ── 히스토리 차트 데이터 ──
+    all_dates = sorted(set(
+        d for pn in pnames for d in load_history(uid, pn).keys()
+    ))
+    show_hist = len(all_dates) > 1
+    hist_dates_js = json.dumps(all_dates)
+    if show_hist:
+        hist_datasets = []
+        for i, pn in enumerate(pnames):
+            hist_p     = load_history(uid, pn)
+            nav_series = [hist_p.get(d, {}).get("nav_return") for d in all_dates]
+            hist_datasets.append({
+                "label":           escape(all_portfolios[pn].get("name", pn)),
+                "data":            nav_series,
+                "borderColor":     PALETTE[i % len(PALETTE)],
+                "backgroundColor": "transparent",
+                "tension":         0.3,
+                "fill":            False,
+                "pointRadius":     3,
+                "borderWidth":     2,
+                "spanGaps":        True,
+            })
+        chart_datasets_json = json.dumps(hist_datasets, ensure_ascii=False)
+    else:
+        chart_datasets_json = "[]"
+
+    # ── 포트폴리오 요약 rows (비중 차트 우측 패널) ──
+    stat_rows = ""
+    for i, ps in enumerate(portfolio_stats):
+        color  = PALETTE[i % len(PALETTE)]
+        pnl_c  = "#16a34a" if ps["pnl_pct"] >= 0 else "#dc2626"
+        pnl_s  = "+" if ps["pnl_pct"] >= 0 else ""
+        weight = round(ps["total_ev"] / combined_total * 100, 1) if combined_total > 0 else 0
+        stat_rows += (
+            f'<div style="display:flex;align-items:center;gap:10px;padding:6px 0;'
+            f'border-bottom:1px solid #f1f5f9">'
+            f'<div style="width:10px;height:10px;border-radius:50%;background:{color};flex-shrink:0"></div>'
+            f'<div style="flex:1;font-size:.82rem;font-weight:600;color:var(--text)">{ps["name"]}</div>'
+            f'<div style="font-size:.78rem;color:{pnl_c};font-weight:600">{pnl_s}{ps["pnl_pct"]:.2f}%</div>'
+            f'<div style="font-size:.75rem;color:var(--muted);min-width:36px;text-align:right">{weight:.1f}%</div>'
+            f'</div>'
+        )
+
+    # ── 포트폴리오 카드 HTML ──
+    portfolio_cards = ""
+    for i, ps in enumerate(portfolio_stats):
+        color  = PALETTE[i % len(PALETTE)]
+        pnl_c  = "#16a34a" if ps["pnl_pct"] >= 0 else "#dc2626"
+        pnl_s  = "+" if ps["pnl_pct"] >= 0 else ""
+        nav_html = ""
+        if ps["nav_ret"] is not None:
+            nc = "#16a34a" if ps["nav_ret"] >= 0 else "#dc2626"
+            ns = "+" if ps["nav_ret"] >= 0 else ""
+            nav_html = (
+                f'<div style="margin-top:6px;font-size:.78rem;color:{nc};font-weight:600">'
+                f'계좌 수익률(NAV): {ns}{ps["nav_ret"]:.2f}%</div>'
+            )
+        portfolio_cards += (
+            f'<div class="card" style="cursor:pointer;border-top:3px solid {color}" '
+            f'onclick="location.href=\'/u/{uid}/p/{ps["pname"]}?t={token}\'">'
+            f'<div style="font-size:.9rem;font-weight:700;color:var(--text);margin-bottom:4px">{ps["name"]}</div>'
+            f'<div style="font-size:.72rem;color:var(--muted);margin-bottom:12px">'
+            f'기준: {ps["ts"]} · {ps["count"]}개 종목</div>'
+            f'<div style="font-size:1.5rem;font-weight:700;color:var(--text)">{fmt_krw(ps["total_ev"])}</div>'
+            f'<div style="margin-top:6px;font-size:.85rem;color:{pnl_c};font-weight:600">'
+            f'종목 수익률: {pnl_s}{ps["pnl_pct"]:.2f}%</div>'
+            f'{nav_html}'
+            f'</div>'
+        )
+
+    # ── 히스토리 차트 섹션 ──
+    hist_section = ""
+    hist_js      = ""
+    if show_hist:
+        hist_section = (
+            '<div class="card" style="margin-bottom:16px">'
+            '<div class="card-title">포트폴리오별 수익률 추이</div>'
+            '<div style="position:relative;height:240px"><canvas id="combinedHistChart"></canvas></div>'
+            '</div>'
+        )
+        hist_js = f"""
+try {{
+  const combinedHistChart = new Chart(document.getElementById("combinedHistChart"), {{
+    type: "line",
+    data: {{
+      labels: {hist_dates_js},
+      datasets: {chart_datasets_json},
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      plugins: {{
+        legend: {{ position: "top", labels: {{ boxWidth: 9, padding: 10, font: {{ size: 11 }} }} }},
+        tooltip: {{
+          mode: "index", intersect: false,
+          callbacks: {{
+            label: function(c) {{
+              var v = c.parsed.y;
+              return " " + c.dataset.label + ": " + (v == null ? "—" : (v >= 0 ? "+" : "") + v.toFixed(2) + "%");
+            }},
+          }},
+        }},
+      }},
+      scales: {{
+        x: {{ grid: {{ display: false }}, ticks: {{ color: "#94a3b8", font: {{ size: 10 }}, maxTicksLimit: 8 }} }},
+        y: {{ grid: {{ color: "#f1f5f9" }}, ticks: {{ color: "#94a3b8", callback: function(v) {{ return (v >= 0 ? "+" : "") + v + "%"; }} }} }},
+      }},
+    }},
+  }});
+}} catch(e) {{
+  console.error("combinedHistChart 오류:", e);
+}}"""
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>전체 포트폴리오</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {{
+  --bg:#f1f5f9; --surface:#fff;
+  --border:#e2e8f0; --border-subtle:#f1f5f9;
+  --text:#0f172a; --secondary:#64748b; --muted:#94a3b8;
+  --pos:#16a34a; --neg:#dc2626; --accent:#0ea5e9;
+  --shadow:0 1px 3px rgba(0,0,0,.07),0 1px 2px rgba(0,0,0,.04);
+  --shadow-md:0 4px 8px rgba(0,0,0,.06),0 2px 4px rgba(0,0,0,.04);
+}}
+*,*::before,*::after {{ box-sizing:border-box; margin:0; padding:0; }}
+body {{ background:var(--bg); color:var(--text); font-family:'Noto Sans KR',sans-serif; min-height:100vh; font-size:14px; -webkit-font-smoothing:antialiased; }}
+.topnav {{ background:var(--surface); border-bottom:1px solid var(--border); padding:0 28px; display:flex; align-items:center; height:52px; position:sticky; top:0; z-index:100; box-shadow:0 1px 0 var(--border); }}
+.brand {{ font-weight:800; font-size:.95rem; color:var(--text); letter-spacing:-.01em; margin-right:24px; display:flex; align-items:center; gap:7px; flex-shrink:0; }}
+.brand-dot {{ width:7px; height:7px; border-radius:50%; background:var(--accent); }}
+.tab {{ display:inline-flex; align-items:center; height:52px; padding:0 14px; font-size:.85rem; font-weight:500; color:var(--secondary); text-decoration:none; border-bottom:2px solid transparent; transition:all .15s; white-space:nowrap; }}
+.tab:hover {{ color:var(--text); }}
+.tab.active {{ color:var(--text); font-weight:700; border-bottom-color:var(--accent); }}
+.nav-time {{ margin-left:auto; font-size:.72rem; color:var(--muted); flex-shrink:0; }}
+.main {{ max-width:1160px; margin:0 auto; padding:28px 20px 48px; }}
+.overview {{ background:var(--surface); border-radius:14px; box-shadow:var(--shadow-md); padding:26px 30px; margin-bottom:16px; display:flex; align-items:center; gap:0; flex-wrap:wrap; row-gap:16px; animation:fadeIn .3s ease both; }}
+.ov-main {{ flex-shrink:0; padding-right:30px; border-right:1px solid var(--border); margin-right:30px; }}
+.ov-main .ov-label {{ font-size:.68rem; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; margin-bottom:6px; font-weight:600; }}
+.ov-main .ov-value {{ font-size:2.1rem; font-weight:700; color:var(--text); letter-spacing:-.03em; line-height:1; }}
+.ov-metrics {{ display:flex; gap:0; flex-wrap:wrap; }}
+.ov-metric {{ padding:0 26px; border-right:1px solid var(--border); display:flex; flex-direction:column; gap:5px; }}
+.ov-metric:last-child {{ border-right:none; }}
+.m-label {{ font-size:.68rem; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-weight:600; }}
+.m-value {{ font-size:1.15rem; font-weight:700; line-height:1; }}
+.m-sub {{ font-size:.72rem; color:var(--muted); }}
+.charts-grid {{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; margin-bottom:16px; }}
+@media(max-width:1000px) {{ .charts-grid {{ grid-template-columns:1fr 1fr; }} }}
+@media(max-width:640px)  {{ .charts-grid {{ grid-template-columns:1fr; }} }}
+.card {{ background:var(--surface); border-radius:14px; box-shadow:var(--shadow); padding:22px; }}
+.card-title {{ font-size:.7rem; font-weight:700; color:var(--secondary); text-transform:uppercase; letter-spacing:.12em; margin-bottom:16px; display:flex; align-items:center; gap:8px; }}
+.card-title::before {{ content:""; display:inline-block; width:3px; height:11px; background:var(--accent); border-radius:2px; flex-shrink:0; }}
+.footer {{ text-align:center; padding:28px 0 4px; font-size:.65rem; color:#cbd5e1; letter-spacing:.1em; text-transform:uppercase; }}
+@keyframes fadeIn {{ from {{ opacity:0; transform:translateY(10px); }} to {{ opacity:1; transform:translateY(0); }} }}
+.help-wrap {{ position:relative; display:inline-flex; align-items:center; gap:3px; }}
+.help-icon {{ display:inline-flex; align-items:center; justify-content:center; width:13px; height:13px; border-radius:50%; background:#cbd5e1; color:#fff; font-size:9px; font-weight:700; cursor:default; line-height:1; flex-shrink:0; }}
+.help-tip {{ display:none; position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%); background:#1e293b; color:#f8fafc; font-size:.72rem; line-height:1.5; padding:7px 10px; border-radius:8px; white-space:nowrap; z-index:200; pointer-events:none; box-shadow:0 4px 12px rgba(0,0,0,.2); }}
+.help-tip::after {{ content:""; position:absolute; top:100%; left:50%; transform:translateX(-50%); border:5px solid transparent; border-top-color:#1e293b; }}
+.help-wrap:hover .help-tip {{ display:block; }}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="brand"><div class="brand-dot"></div>PORTFOLIO</div>
+  {portfolio_tabs}
+  <div class="nav-time">기준: {today_str}</div>
+</nav>
+
+<div class="main">
+  <div class="overview">
+    <div class="ov-main">
+      <div class="ov-label">총 평가금액</div>
+      <div class="ov-value">{fmt_krw(combined_total)}</div>
+    </div>
+    <div class="ov-metrics">
+      <div class="ov-metric">
+        <div class="m-label">총 손익</div>
+        <div class="m-value" style="color:{pnl_color}">{pnl_sign}{fmt_krw(combined_pnl)}</div>
+        <div class="m-sub" style="color:{pnl_color}">{pnl_sign}{combined_pnl_pct:.2f}%</div>
+      </div>
+      <div class="ov-metric">
+        <div class="m-label"><span class="help-wrap">통합 계좌 수익률<span class="help-icon">?</span><span class="help-tip">모든 포트폴리오 입출금 통합 NAV 기준</span></span></div>
+        <div class="m-value" style="color:{nav_color}">{nav_sign}{combined_nav_ret:.2f}%</div>
+        <div class="m-sub">입출금 제거 기준</div>
+      </div>
+      <div class="ov-metric">
+        <div class="m-label">순 투자원금</div>
+        <div class="m-value" style="color:var(--text)">{inv_disp}</div>
+        <div class="m-sub">총입금 - 총출금</div>
+      </div>
+      <div class="ov-metric">
+        <div class="m-label">포트폴리오 수</div>
+        <div class="m-value" style="color:var(--text)">{len(portfolio_stats)}개</div>
+        <div class="m-sub">데이터 있는 포트폴리오</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="charts-grid" style="grid-template-columns:1fr 1fr">
+    <div class="card">
+      <div class="card-title">포트폴리오별 비중</div>
+      <div style="position:relative;height:220px"><canvas id="pieChart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-title">포트폴리오 현황</div>
+      <div style="padding-top:4px">{stat_rows}</div>
+    </div>
+  </div>
+
+  {hist_section}
+
+  <div class="charts-grid">
+    {portfolio_cards}
+  </div>
+
+  <div class="footer">Portfolio Dashboard &middot; {today_str} &middot; 투자 참고용</div>
+</div>
+
+<script>
+try {{
+  Chart.defaults.font.family = "'Noto Sans KR',sans-serif";
+  Chart.defaults.color = "#94a3b8";
+  Chart.defaults.font.size = 11;
+
+  new Chart(document.getElementById("pieChart"), {{
+    type: "doughnut",
+    data: {{
+      labels: {pie_labels},
+      datasets: [{{ data: {pie_data}, backgroundColor: {pie_colors}, borderWidth: 3, borderColor: "#fff", hoverOffset: 6 }}],
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: "65%",
+      plugins: {{
+        legend: {{ position: "bottom", labels: {{ boxWidth: 9, padding: 12, font: {{ size: 11 }}, color: "#64748b" }} }},
+        tooltip: {{ callbacks: {{ label: c => ` ${{c.label}}: ${{c.parsed}}%` }} }},
+      }},
+    }},
+  }});
+}} catch(e) {{
+  console.error("pieChart 오류:", e);
+}}
+{hist_js}
+</script>
+</body>
+</html>"""
+
+
 # =======================================================
 # bot.py
 # =======================================================
@@ -1855,8 +2234,9 @@ def portfolio_page(uid: int, pname: str):
     state = _get_user_state(uid)
     if pname not in state["portfolios"]:
         abort(404)
-    state["active_pname"] = pname
-    save_portfolios(uid, state["portfolios"], pname)
+    with _users_lock:
+        state["active_pname"] = pname
+        save_portfolios(uid, state["portfolios"], pname)
     p     = state["portfolios"][pname]
     token = get_user_token(uid)
     if p.get("df") is not None and len(p["df"]) > 0:
@@ -1870,6 +2250,20 @@ def portfolio_page(uid: int, pname: str):
         uid=uid,
         token=token,
     )
+
+
+@app_flask.route("/u/<int:uid>/p/all")
+def combined_page(uid: int):
+    _check_token(uid)
+    state = _get_user_state(uid)
+    token = get_user_token(uid)
+    if len(state["portfolios"]) < 2:
+        pname = state["active_pname"] or next(iter(state["portfolios"]))
+        return redirect(f"/u/{uid}/p/{pname}?t={token}")
+    for pname, p in state["portfolios"].items():
+        if p.get("df") is not None and len(p.get("df", [])) > 0:
+            _trigger_build_if_needed(uid, pname)
+    return build_combined_html(uid, token, state["portfolios"])
 
 
 # ── 포트폴리오 관리 ──
@@ -1900,8 +2294,9 @@ def api_rename_portfolio(uid: int, pname: str):
     name = str(data.get("name", "")).strip()
     if not name:
         return jsonify({"error": "이름을 입력하세요"}), 400
-    state["portfolios"][pname]["name"] = name
-    rename_portfolio(uid, pname, name)
+    with _users_lock:
+        state["portfolios"][pname]["name"] = name
+        rename_portfolio(uid, pname, name)
     return jsonify({"ok": True})
 
 
@@ -1914,11 +2309,12 @@ def api_delete_portfolio(uid: int, pname: str):
         return jsonify({"error": "포트폴리오 없음"}), 404
     if len(portfolios) <= 1:
         return jsonify({"error": "마지막 포트폴리오는 삭제할 수 없습니다"}), 400
-    del portfolios[pname]
-    new_active = delete_portfolio(uid, pname)
-    if not new_active or new_active not in portfolios:
-        new_active = next(iter(portfolios))
-    state["active_pname"] = new_active
+    with _users_lock:
+        del portfolios[pname]
+        new_active = delete_portfolio(uid, pname)
+        if not new_active or new_active not in portfolios:
+            new_active = next(iter(portfolios))
+        state["active_pname"] = new_active
     token = get_user_token(uid)
     return jsonify({"ok": True, "redirect": f"/u/{uid}/p/{new_active}?t={token}"})
 
@@ -1955,8 +2351,9 @@ def api_add_stock(uid: int, pname: str):
             df = pd.concat([df, new_row], ignore_index=True)
 
         drop_cols = [c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in df.columns]
-        state["portfolios"][pname]["df"] = df.drop(columns=drop_cols)
-        save_portfolios(uid, state["portfolios"], state["active_pname"])
+        with _users_lock:
+            state["portfolios"][pname]["df"] = df.drop(columns=drop_cols)
+            save_portfolios(uid, state["portfolios"], state["active_pname"])
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1969,11 +2366,12 @@ def api_del_stock(uid: int, pname: str, name: str):
     state = _get_user_state(uid)
     if pname not in state["portfolios"]:
         return jsonify({"error": "포트폴리오 없음"}), 404
-    df = state["portfolios"][pname]["df"]
-    if name not in df["종목명"].values:
-        return jsonify({"error": "종목 없음"}), 404
-    state["portfolios"][pname]["df"] = df[df["종목명"] != name].reset_index(drop=True)
-    save_portfolios(uid, state["portfolios"], state["active_pname"])
+    with _users_lock:
+        df = state["portfolios"][pname]["df"].copy()
+        if name not in df["종목명"].values:
+            return jsonify({"error": "종목 없음"}), 404
+        state["portfolios"][pname]["df"] = df[df["종목명"] != name].reset_index(drop=True)
+        save_portfolios(uid, state["portfolios"], state["active_pname"])
     return jsonify({"ok": True})
 
 
@@ -2011,10 +2409,18 @@ def api_index_returns(uid: int):
                 result[name] = []
                 continue
             closes = df_idx["Close"]
-            if hasattr(closes, "squeeze"):
+            if isinstance(closes, pd.DataFrame):
+                closes = closes.iloc[:, 0]
+            elif hasattr(closes, "squeeze"):
                 closes = closes.squeeze()
             closes = closes.dropna()
+            if closes.empty:
+                result[name] = []
+                continue
             base = float(closes.iloc[0])
+            if base == 0:
+                result[name] = []
+                continue
             result[name] = [
                 {"date": str(d.date()), "return": round((float(v) - base) / base * 100, 4)}
                 for d, v in closes.items()
@@ -2034,6 +2440,9 @@ def api_get_cashflow(uid: int, pname: str):
 @app_flask.route("/u/<int:uid>/api/cashflow/<pname>", methods=["POST"])
 def api_add_cashflow_route(uid: int, pname: str):
     _check_token(uid)
+    state = _get_user_state(uid)
+    if pname not in state["portfolios"]:
+        return jsonify({"error": "포트폴리오 없음"}), 404
     data = request.get_json()
     try:
         type_  = str(data["type"]).strip()
@@ -2109,11 +2518,12 @@ def build_dashboard_for(uid: int, pname: str) -> pd.DataFrame:
         columns=[c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in p["df"].columns]
     )
     df = fetch_prices(df_raw)
-    state["portfolios"][pname]["df"]          = df
-    state["portfolios"][pname]["last_update"] = datetime.now(KST)
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
     save_snapshot(uid, pname, df, usd_krw)
-    save_portfolios(uid, state["portfolios"], state["active_pname"])
+    with _users_lock:
+        state["portfolios"][pname]["df"]          = df
+        state["portfolios"][pname]["last_update"] = datetime.now(KST)
+        save_portfolios(uid, state["portfolios"], state["active_pname"])
     return df
 
 
@@ -2121,7 +2531,11 @@ def _build_dashboard_bg(uid: int, pname: str) -> None:
     """백그라운드 스레드용 wrapper — 완료 후 _building에서 제거."""
     try:
         build_dashboard_for(uid, pname)
-    finally:
+    except Exception:
+        with _build_lock:
+            _building.discard((uid, pname))
+            _hist_check.pop((uid, pname), None)
+    else:
         with _build_lock:
             _building.discard((uid, pname))
 
@@ -2155,17 +2569,16 @@ def _summary_text(uid: int, pname: str) -> str:
     cashflows_s  = load_cashflow(uid, pname)
     net_inv_s    = sum(c["amount"] for c in cashflows_s if c["type"] == "in") \
                  - sum(c["amount"] for c in cashflows_s if c["type"] == "out")
-    total_buy_s  = sum(
-        float(r["평단가"]) * (float(r["수량"]) if pd.notna(r.get("수량")) else 0.0)
-        * (usd_krw_s if str(r.get("통화", "KRW")).upper() == "USD" else 1.0)
-        for _, r in df.iterrows()
-    )
-    stock_eval_s = sum(
-        (float(r["현재가"]) if pd.notna(r.get("현재가")) else float(r["평단가"]))
-        * (float(r["수량"]) if pd.notna(r.get("수량")) else 0.0)
-        * (usd_krw_s if str(r.get("통화", "KRW")).upper() == "USD" else 1.0)
-        for _, r in df.iterrows()
-    )
+    row_data     = []
+    total_buy_s  = 0.0
+    stock_eval_s = 0.0
+    for _, r in df.iterrows():
+        fx  = usd_krw_s if str(r.get("통화", "KRW")).upper() == "USD" else 1.0
+        qty = float(r["수량"]) if pd.notna(r.get("수량")) else 0.0
+        total_buy_s  += float(r["평단가"]) * qty * fx
+        cur = float(r["현재가"]) if pd.notna(r.get("현재가")) else float(r["평단가"])
+        stock_eval_s += cur * qty * fx
+        row_data.append(r)
     cash_s       = max(0.0, net_inv_s - total_buy_s) if net_inv_s > 0 else 0.0
     total_ev_s   = stock_eval_s + cash_s
     _w_scale_s   = stock_eval_s / total_ev_s if total_ev_s > 0 else 1.0
@@ -2187,10 +2600,36 @@ def _summary_text(uid: int, pname: str) -> str:
             nav_emoji = "🟢" if nav_ret >= 0 else "🔴"
             lines.append(f"{nav_emoji} *계좌 수익률(NAV): {'+' if nav_ret>=0 else ''}{nav_ret:.2f}%*\n")
 
+    all_pnames = list(state["portfolios"].keys())
+    if len(all_pnames) > 1:
+        c_total = 0.0
+        for _pn, _p in state["portfolios"].items():
+            _df = _p.get("df")
+            if _df is None or len(_df) == 0:
+                continue
+            _usd = float(_df["USD_KRW"].iloc[0]) if "USD_KRW" in _df.columns and len(_df) > 0 else 1370.0
+            _s_eval = 0.0
+            _t_buy  = 0.0
+            for _, _r in _df.iterrows():
+                _m   = _usd if str(_r.get("통화", "KRW")).upper() == "USD" else 1.0
+                _q   = float(_r["수량"]) if pd.notna(_r.get("수량")) else 0.0
+                _cur = float(_r["현재가"]) if pd.notna(_r.get("현재가")) else float(_r["평단가"])
+                _s_eval += _cur * _q * _m
+                _t_buy  += float(_r["평단가"]) * _q * _m
+            _cf   = load_cashflow(uid, _pn)
+            _ni   = (sum(c["amount"] for c in _cf if c["type"] == "in")
+                   - sum(c["amount"] for c in _cf if c["type"] == "out"))
+            _cash = max(0.0, _ni - _t_buy) if _ni > 0 else 0.0
+            c_total += _s_eval + _cash
+        c_nav, _ = compute_combined_nav(uid, all_pnames, c_total)
+        c_nav_ret = (c_nav / 1000.0 - 1) * 100
+        c_emoji   = "🟢" if c_nav_ret >= 0 else "🔴"
+        lines.append(f"{c_emoji} *전체 계좌 수익률: {'+' if c_nav_ret>=0 else ''}{c_nav_ret:.2f}%*\n")
+
     lines.append("```")
     lines.append(f"{'종목':<10} {'비중':>5} {'수익률':>8}")
     lines.append("─" * 26)
-    for _, r in df.iterrows():
+    for r in row_data:
         ret     = r["수익률(%)"]
         ret_str = "   —  " if pd.isna(ret) else f"{'+' if ret>=0 else ''}{ret:.2f}%"
         lines.append(f"{r['종목명']:<10} {r['비중(%)'] * _w_scale_s:>4.1f}% {ret_str:>8}")
@@ -2320,7 +2759,9 @@ async def scheduled_snapshot():
     """가격 재조회 없이 현재 df 기준으로 모든 유저·포트폴리오 스냅샷 저장."""
     for uid, state in list(all_users.items()):
         for pname, p in list(state["portfolios"].items()):
-            df = p.get("df")
+            with _users_lock:
+                _df = p.get("df")
+                df  = _df.copy() if _df is not None and len(_df) > 0 else None
             if df is None or len(df) == 0:
                 continue
             try:
