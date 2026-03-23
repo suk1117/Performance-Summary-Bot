@@ -315,20 +315,23 @@ print("="*60)
 src = inspect.getsource(combined_bot.build_dashboard_for)
 lines = src.splitlines()
 
-# save_snapshot 호출 라인과 'with _users_lock:' 라인의 상대 위치 확인
-snapshot_idx = next((i for i, l in enumerate(lines) if "save_snapshot(" in l), None)
-lock_idx     = next((i for i, l in enumerate(lines) if "with _users_lock:" in l), None)
+# save_snapshot 호출 라인과 마지막 'with _users_lock:' 라인의 상대 위치 확인
+# build_dashboard_for는 읽기용 lock + save_snapshot + 쓰기용 lock 구조
+snapshot_idx  = next((i for i, l in enumerate(lines) if "save_snapshot(" in l), None)
+all_lock_idxs = [i for i, l in enumerate(lines) if "with _users_lock:" in l]
+# 쓰기용 lock = save_snapshot 이후에 나오는 첫 번째 lock
+write_lock_idx = next((i for i in all_lock_idxs if snapshot_idx is not None and i > snapshot_idx), None)
 
 check("save_snapshot 코드 존재", snapshot_idx is not None)
-check("_users_lock 블록 코드 존재", lock_idx is not None)
+check("_users_lock 블록 코드 존재", len(all_lock_idxs) > 0)
 check("save_snapshot이 _users_lock 블록 앞에 위치",
-      snapshot_idx is not None and lock_idx is not None and snapshot_idx < lock_idx)
+      snapshot_idx is not None and write_lock_idx is not None and snapshot_idx < write_lock_idx)
 
-# 락 블록 안에 save_snapshot이 없는지 확인 (들여쓰기 기준)
-if lock_idx is not None:
-    lock_indent = len(lines[lock_idx]) - len(lines[lock_idx].lstrip())
+# 쓰기용 락 블록 안에 save_snapshot이 없는지 확인 (들여쓰기 기준)
+if write_lock_idx is not None:
+    lock_indent = len(lines[write_lock_idx]) - len(lines[write_lock_idx].lstrip())
     inside_lock = [
-        l for l in lines[lock_idx+1:]
+        l for l in lines[write_lock_idx+1:]
         if l.strip() and (len(l) - len(l.lstrip())) > lock_indent and "save_snapshot(" in l
     ]
     check("_users_lock 블록 내 save_snapshot 없음", len(inside_lock) == 0)

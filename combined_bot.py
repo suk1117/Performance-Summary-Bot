@@ -887,9 +887,8 @@ def build_user_html(
         else:
             buy_str = eval_str = "—"
 
-        import json as _json
-        _ed = _json.dumps({"name": name, "country": r["국가"], "qty": qty or 0, "avg": avg, "weight": weight})
-        _name_js = _json.dumps(name, ensure_ascii=False).replace('"', '&quot;')
+        _ed = json.dumps({"name": name, "country": r["국가"], "qty": qty or 0, "avg": avg, "weight": weight})
+        _name_js = json.dumps(name, ensure_ascii=False).replace('"', '&quot;')
         edit_btns = (
             f'<td style="text-align:right;white-space:nowrap">'
             f'<button onclick=\'openEditModal({_ed})\' style="background:none;border:1px solid var(--border);'
@@ -1755,10 +1754,6 @@ try {{
 </html>"""
 
 
-def build_html(df: pd.DataFrame) -> str:
-    return build_user_html(df)
-
-
 def build_combined_html(uid: int, token: str, all_portfolios: dict) -> str:
     today_str = datetime.now().strftime("%Y.%m.%d %H:%M")
     pnames    = list(all_portfolios.keys())
@@ -1785,7 +1780,7 @@ def build_combined_html(uid: int, token: str, all_portfolios: dict) -> str:
             if net_inv > 0:
                 portfolio_stats.append({
                     "pname":    pname,
-                    "name":     escape(p.get("name", pname)),
+                    "name":     p.get("name", pname),
                     "total_ev": net_inv,
                     "pnl_pct":  0.0,
                     "nav_ret":  None,
@@ -1822,7 +1817,7 @@ def build_combined_html(uid: int, token: str, all_portfolios: dict) -> str:
         combined_total_buy  += t_buy
         portfolio_stats.append({
             "pname":    pname,
-            "name":     escape(p.get("name", pname)),
+            "name":     p.get("name", pname),
             "total_ev": total_ev_p,
             "pnl_pct":  pnl_pct_p,
             "nav_ret":  nav_ret_p,
@@ -1846,7 +1841,7 @@ def build_combined_html(uid: int, token: str, all_portfolios: dict) -> str:
 
     # ── 탭 / 파이차트 데이터 ──
     portfolio_tabs = _build_portfolio_tabs(all_portfolios, "all", uid=uid, token=token)
-    pie_labels = json.dumps([ps["name"] for ps in portfolio_stats], ensure_ascii=False)
+    pie_labels = json.dumps([escape(ps["name"]) for ps in portfolio_stats], ensure_ascii=False)
     pie_data   = json.dumps([
         round(ps["total_ev"] / combined_total * 100, 2) if combined_total > 0 else 0
         for ps in portfolio_stats
@@ -1890,7 +1885,7 @@ def build_combined_html(uid: int, token: str, all_portfolios: dict) -> str:
             f'<div style="display:flex;align-items:center;gap:10px;padding:6px 0;'
             f'border-bottom:1px solid #f1f5f9">'
             f'<div style="width:10px;height:10px;border-radius:50%;background:{color};flex-shrink:0"></div>'
-            f'<div style="flex:1;font-size:.82rem;font-weight:600;color:var(--text)">{ps["name"]}</div>'
+            f'<div style="flex:1;font-size:.82rem;font-weight:600;color:var(--text)">{escape(ps["name"])}</div>'
             f'<div style="font-size:.78rem;color:{pnl_c};font-weight:600">{pnl_s}{ps["pnl_pct"]:.2f}%</div>'
             f'<div style="font-size:.75rem;color:var(--muted);min-width:36px;text-align:right">{weight:.1f}%</div>'
             f'</div>'
@@ -1913,7 +1908,7 @@ def build_combined_html(uid: int, token: str, all_portfolios: dict) -> str:
         portfolio_cards += (
             f'<div class="card" style="cursor:pointer;border-top:3px solid {color}" '
             f'onclick="location.href=\'/u/{uid}/p/{ps["pname"]}?t={token}\'">'
-            f'<div style="font-size:.9rem;font-weight:700;color:var(--text);margin-bottom:4px">{ps["name"]}</div>'
+            f'<div style="font-size:.9rem;font-weight:700;color:var(--text);margin-bottom:4px">{escape(ps["name"])}</div>'
             f'<div style="font-size:.72rem;color:var(--muted);margin-bottom:12px">'
             f'기준: {ps["ts"]} · {ps["count"]}개 종목</div>'
             f'<div style="font-size:1.5rem;font-weight:700;color:var(--text)">{fmt_krw(ps["total_ev"])}</div>'
@@ -2525,11 +2520,12 @@ def start_ngrok() -> str:
 # ────────────────────────────────────────
 def build_dashboard_for(uid: int, pname: str) -> pd.DataFrame:
     state  = _get_user_state(uid)
-    p      = state["portfolios"][pname]
-    df_raw = p["df"].drop(
-        columns=[c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in p["df"].columns]
-    )
-    df = fetch_prices(df_raw)
+    with _users_lock:
+        p      = state["portfolios"][pname]
+        df_raw = p["df"].drop(
+            columns=[c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in p["df"].columns]
+        ).copy()
+    df = fetch_prices(df_raw)   # 락 밖에서 네트워크 IO
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
     save_snapshot(uid, pname, df, usd_krw)
     with _users_lock:
