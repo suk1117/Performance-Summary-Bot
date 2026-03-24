@@ -102,63 +102,49 @@ def get_user_token(uid: int) -> str:
 
 
 # ─── 구버전 마이그레이션 ──────────────────────────────
-def _migrate(uid: int):
-    """기존 data/portfolios.json → data/user_{uid}/portfolios.json"""
+def _migrate(uid: int, owner_uid: int):
+    """기존 data/portfolio.json → data/user_{uid}/portfolios.json"""
     dst = _portfolios_file(uid)
     if os.path.exists(dst):
         return
     import shutil
-    # 멀티 포트폴리오 구버전
-    old_portfolios = os.path.join(DATA_DIR, "portfolios.json")
-    if os.path.exists(old_portfolios):
+    # 단일 포트폴리오 구버전
+    if uid == owner_uid:
+        old_file = os.path.join(DATA_DIR, "portfolio.json")
+        if not os.path.exists(old_file):
+            return
         try:
-            shutil.copy2(old_portfolios, dst)
-            for fname in os.listdir(DATA_DIR):
-                if fname.startswith("history_") or fname.startswith("cashflow_"):
-                    src = os.path.join(DATA_DIR, fname)
-                    d   = os.path.join(_user_dir(uid), fname)
-                    if not os.path.exists(d):
-                        shutil.copy2(src, d)
-            print(f"✅ 기존 데이터 → data/user_{uid}/ 마이그레이션 완료")
+            with open(old_file, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            pname = "p1"
+            raw = {
+                "active":  pname,
+                "next_id": 2,
+                "items": {
+                    pname: {
+                        "name":        old.get("name", "기본 포트폴리오"),
+                        "last_update": old.get("last_update"),
+                        "df":          old.get("df", []),
+                    }
+                },
+            }
+            _save_raw(uid, raw)
+            for old_name, new_name in [
+                ("cashflow.json", f"cashflow_{pname}.json"),
+                ("history.json",  f"history_{pname}.json"),
+            ]:
+                src = os.path.join(DATA_DIR, old_name)
+                d   = os.path.join(_user_dir(uid), new_name)
+                if os.path.exists(src) and not os.path.exists(d):
+                    shutil.copy2(src, d)
+            print(f"✅ portfolio.json → data/user_{uid}/ 마이그레이션 완료")
         except Exception as e:
             print(f"⚠️  마이그레이션 오류: {e}")
-        return
-    # 단일 포트폴리오 구버전
-    old_file = os.path.join(DATA_DIR, "portfolio.json")
-    if not os.path.exists(old_file):
-        return
-    try:
-        with open(old_file, "r", encoding="utf-8") as f:
-            old = json.load(f)
-        pname = "p1"
-        raw = {
-            "active":  pname,
-            "next_id": 2,
-            "items": {
-                pname: {
-                    "name":        old.get("name", "기본 포트폴리오"),
-                    "last_update": old.get("last_update"),
-                    "df":          old.get("df", []),
-                }
-            },
-        }
-        _save_raw(uid, raw)
-        for old_name, new_name in [
-            ("cashflow.json", f"cashflow_{pname}.json"),
-            ("history.json",  f"history_{pname}.json"),
-        ]:
-            src = os.path.join(DATA_DIR, old_name)
-            d   = os.path.join(_user_dir(uid), new_name)
-            if os.path.exists(src) and not os.path.exists(d):
-                shutil.copy2(src, d)
-        print(f"✅ portfolio.json → data/user_{uid}/ 마이그레이션 완료")
-    except Exception as e:
-        print(f"⚠️  마이그레이션 오류: {e}")
 
 
 # ─── 포트폴리오 로드/저장 ─────────────────────────────
 def load_portfolios(uid: int) -> tuple[dict, str]:
-    _migrate(uid)
+    _migrate(uid, TELEGRAM_CHAT_ID)
     raw = _raw(uid)
     items = {}
     for pname, p in raw.get("items", {}).items():
@@ -1340,6 +1326,17 @@ tbody td {{ padding:12px 10px; }}
 <nav class="topnav">
   <div class="brand"><div class="brand-dot"></div>PORTFOLIO</div>
   {portfolio_tabs}
+  <button id="refreshBtn"
+  onclick="(function(){{
+    var btn=document.getElementById('refreshBtn');
+    btn.disabled=true; btn.textContent='새로고침 중...';
+    fetch('/u/{uid}/api/p/{pname_js}/refresh?t={token}', {{method:'POST'}})
+      .finally(function(){{ setTimeout(function(){{ location.reload(); }}, 2000); }});
+  }})()"
+  style="margin-left:auto;padding:0 12px;height:32px;background:#0ea5e9;color:#fff;
+         border:none;border-radius:6px;font-size:.8rem;cursor:pointer;flex-shrink:0">
+  🔄
+</button>
   <div class="nav-time">기준: {today_str}</div>
 </nav>
 
@@ -1609,9 +1606,11 @@ async function deleteStock(name) {{
 }}
 
 async function refreshPrices() {{
-  const btn = document.getElementById('refresh-btn');
-  if (!btn) return;
-  btn.textContent = '조회 중...'; btn.disabled = true;
+  const btn    = document.getElementById('refresh-btn');
+  const navBtn = document.getElementById('topnav-refresh-btn');
+  if (!btn && !navBtn) return;
+  if (btn)    {{ btn.textContent = '조회 중...';      btn.disabled = true; }}
+  if (navBtn) {{ navBtn.textContent = '새로고침 중...'; navBtn.disabled = true; }}
   try {{
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), 120000);
@@ -1622,7 +1621,8 @@ async function refreshPrices() {{
   }} catch(e) {{
     alert('가격 조회 오류: ' + (e.name === 'AbortError' ? '시간 초과 (120초)' : e.message));
   }} finally {{
-    btn.textContent = '🔄 가격 새로고침'; btn.disabled = false;
+    if (btn)    {{ btn.textContent = '🔄 가격 새로고침'; btn.disabled = false; }}
+    if (navBtn) {{ navBtn.textContent = '🔄';            navBtn.disabled = false; }}
   }}
 }}
 
@@ -2168,9 +2168,10 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.constants import ParseMode
+from telegram.error import Forbidden as TgForbidden, BadRequest as TgBadRequest
 
 # ══════════════════════════════════════════
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "여기에_텔레그램_토큰_입력")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "8751765522:AAENhZFtOWxv46V9rK2IMHqKre_RaGxysJM")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 NGROK_TOKEN      = os.getenv("NGROK_TOKEN",       "여기에_ngrok_토큰_입력")
 FLASK_PORT       = int(os.getenv("FLASK_PORT",    "5050"))
@@ -2320,7 +2321,7 @@ def portfolio_page(uid: int, pname: str):
     with _users_lock:
         state["active_pname"] = pname
         save_portfolios(uid, state["portfolios"], pname)
-    p     = state["portfolios"][pname]
+        p = state["portfolios"][pname]
     token = get_user_token(uid)
     if p.get("df") is not None and len(p["df"]) > 0:
         _trigger_build_if_needed(uid, pname)
@@ -2405,6 +2406,9 @@ def api_delete_portfolio(uid: int, pname: str):
             new_active = state["active_pname"]
         state["active_pname"] = new_active
         save_portfolios(uid, portfolios, new_active)   # 인메모리로 디스크 저장
+    with _build_lock:
+        _building.discard((uid, pname))
+        _hist_check.pop((uid, pname), None)
     token = get_user_token(uid)
     return jsonify({"ok": True, "redirect": f"/u/{uid}/p/{new_active}?t={token}"})
 
@@ -2474,11 +2478,15 @@ def api_refresh(uid: int, pname: str):
     df = state["portfolios"][pname].get("df")
     if df is None or len(df) == 0:
         return jsonify({"error": "종목을 먼저 추가해 주세요"}), 400
-    try:
-        build_dashboard_for(uid, pname)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    key = (uid, pname)
+    with _build_lock:
+        already = key in _building
+        if not already:
+            _building.add(key)
+            _hist_check[key] = datetime.now(KST).strftime("%Y-%m-%d")
+    if not already:
+        threading.Thread(target=_build_dashboard_bg, args=(uid, pname), daemon=True).start()
+    return jsonify({"ok": True, "building": True})
 
 
 # ── 지수 비교 ──
@@ -2611,6 +2619,8 @@ def build_dashboard_for(uid: int, pname: str) -> pd.DataFrame:
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
     save_snapshot(uid, pname, df, usd_krw)
     with _users_lock:
+        if pname not in state["portfolios"]:
+            return df
         state["portfolios"][pname]["df"]          = df
         state["portfolios"][pname]["last_update"] = datetime.now(KST)
         save_portfolios(uid, state["portfolios"], state["active_pname"])
@@ -2647,8 +2657,9 @@ def _trigger_build_if_needed(uid: int, pname: str) -> None:
 # ────────────────────────────────────────
 def _summary_text(uid: int, pname: str) -> str:
     state = _get_user_state(uid)
-    p     = state["portfolios"][pname]
-    df    = p["df"]
+    with _users_lock:
+        p  = state["portfolios"][pname]
+        df = p["df"].copy() if p.get("df") is not None else pd.DataFrame()
     ts    = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
     name  = p.get("name", "포트폴리오")
     token = get_user_token(uid)
@@ -2846,6 +2857,11 @@ async def scheduled_send(label: str):
                     await asyncio.get_running_loop().run_in_executor(
                         None, build_dashboard_for, uid, pname
                     )
+                    with _build_lock:
+                        _hist_check[(uid, pname)] = datetime.now(KST).strftime("%Y-%m-%d")
+                        _building.discard((uid, pname))
+                if pname not in state["portfolios"]:
+                    continue
                 text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(uid, pname)}"
                 await tg_bot.send_message(
                     chat_id=uid,
@@ -2854,6 +2870,10 @@ async def scheduled_send(label: str):
                     disable_web_page_preview=True,
                 )
                 log.info(f"  → uid={uid} {p.get('name')} ({pname}) 전송 완료")
+            except TgForbidden as e:
+                log.warning(f"  → uid={uid} {pname} 봇 차단/미시작: {e}")
+            except TgBadRequest as e:
+                log.warning(f"  → uid={uid} {pname} 봇 차단/미시작: {e}")
             except Exception as e:
                 log.error(f"  → uid={uid} {pname} 전송 실패: {e}")
 
