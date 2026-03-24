@@ -144,7 +144,7 @@ def _migrate(uid: int, owner_uid: int):
 
 # ─── 포트폴리오 로드/저장 ─────────────────────────────
 def load_portfolios(uid: int) -> tuple[dict, str]:
-    _migrate(uid, TELEGRAM_CHAT_ID)
+    _migrate(uid, uid)
     raw = _raw(uid)
     items = {}
     for pname, p in raw.get("items", {}).items():
@@ -2171,9 +2171,9 @@ from telegram.constants import ParseMode
 from telegram.error import Forbidden as TgForbidden, BadRequest as TgBadRequest
 
 # ══════════════════════════════════════════
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "8751765522:AAENhZFtOWxv46V9rK2IMHqKre_RaGxysJM")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-NGROK_TOKEN      = os.getenv("NGROK_TOKEN",       "여기에_ngrok_토큰_입력")
+NGROK_TOKEN      = os.getenv("NGROK_TOKEN", "")
 FLASK_PORT       = int(os.getenv("FLASK_PORT",    "5050"))
 # USE_NGROK=false → ngrok 없이 Flask 직접 노출 (GCP 등 공인 IP 서버에서 사용)
 # FLASK_PUBLIC_URL → 외부에서 접근 가능한 URL (예: http://34.xx.xx.xx:5050)
@@ -2638,6 +2638,7 @@ def _build_dashboard_bg(uid: int, pname: str) -> None:
     else:
         with _build_lock:
             _building.discard((uid, pname))
+            _hist_check.pop((uid, pname), None)
 
 
 def _trigger_build_if_needed(uid: int, pname: str) -> None:
@@ -2857,9 +2858,6 @@ async def scheduled_send(label: str):
                     await asyncio.get_running_loop().run_in_executor(
                         None, build_dashboard_for, uid, pname
                     )
-                    with _build_lock:
-                        _hist_check[(uid, pname)] = datetime.now(KST).strftime("%Y-%m-%d")
-                        _building.discard((uid, pname))
                 if pname not in state["portfolios"]:
                     continue
                 text = f"⏰ *{label} 자동 업데이트*\n\n{_summary_text(uid, pname)}"
