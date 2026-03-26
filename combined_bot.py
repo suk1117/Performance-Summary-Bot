@@ -237,7 +237,7 @@ def create_portfolio(uid: int, name: str) -> str:
 
 def delete_portfolio(uid: int, pname: str):
     """history·cashflow 파일만 삭제. items 저장은 호출자가 save_portfolios로 처리."""
-    for path in [_history_path(uid, pname), _cashflow_path(uid, pname)]:
+    for path in [_history_path(uid, pname), _cashflow_path(uid, pname), _trades_path(uid, pname)]:
         if os.path.exists(path):
             try:
                 os.remove(path)
@@ -345,6 +345,76 @@ def load_cashflow(uid: int, pname: str) -> list:
             return json.load(f)
     except Exception:
         return []
+
+
+def _trades_path(uid: int, pname: str) -> str:
+    return os.path.join(_user_dir(uid), f"trades_{_safe_pname(pname)}.json")
+
+def load_trades(uid: int, pname: str) -> list:
+    fpath = _trades_path(uid, pname)
+    if not os.path.exists(fpath):
+        return []
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_trade(uid: int, pname: str, trade_type: str, name: str, qty: float, price: float,
+               display_avg=None):
+    """
+    매수: price = 매수단가, display_avg = 가중평균 (또는 None)
+    매도: price = 매도단가, display_avg = 기존 매수 평단가 (old_avg)
+    realized_pnl은 매도 타입일 때만 자동 계산
+    """
+    _sell_types = ("일부매도", "전량매도", "sell")
+    fpath   = _trades_path(uid, pname)
+    dirpath = os.path.dirname(fpath)
+    os.makedirs(dirpath, exist_ok=True)
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception:
+        records = []
+    record = {
+        "date":   datetime.now().strftime("%Y-%m-%d"),
+        "time":   datetime.now().strftime("%H:%M"),
+        "type":   trade_type,
+        "name":   name,
+        "qty":    round(qty, 6),
+        "avg":    display_avg if display_avg is not None else price,
+        "amount": round(qty * price, 2),
+    }
+    if trade_type in _sell_types and display_avg is not None:
+        # price = 매도단가, display_avg = 매수 평단가
+        record["realized_pnl"] = round(qty * (price - display_avg), 2)
+    records.append(record)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8",
+                                      dir=dirpath, delete=False, suffix=".tmp") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+        tmp_path = f.name
+    os.replace(tmp_path, fpath)
+
+
+def compute_realized_pnl(uid: int, pname: str) -> tuple:
+    """
+    거래 기록에서 실현 손익 계산.
+    realized_pnl 필드가 있는 거래만 집계 (기존 기록은 skip).
+    반환: (total_realized: float, per_stock: {name: float})
+    """
+    trades = load_trades(uid, pname)
+    total_realized = 0.0
+    per_stock: dict = {}
+    for t in trades:
+        if t.get("type") not in ("일부매도", "전량매도", "sell"):
+            continue
+        realized = t.get("realized_pnl")
+        if realized is None:
+            continue   # realized_pnl 없는 기존 기록 skip
+        total_realized += realized
+        name = t.get("name", "")
+        per_stock[name] = round(per_stock.get(name, 0.0) + realized, 2)
+    return round(total_realized, 2), per_stock
 
 
 def add_cashflow(uid: int, pname: str, type_: str, amount: float, memo: str):
@@ -693,9 +763,11 @@ def build_user_html(
     all_portfolios: dict = None,
     uid: int = 0,
     token: str = "",
+    trades: list = None,
 ) -> str:
     today_str  = datetime.now().strftime("%Y.%m.%d %H:%M")
     cashflows  = cashflows or []
+    trades     = trades or []
     pname_js   = pname or ""
     net_investment = (
         sum(c["amount"] for c in cashflows if c["type"] == "in")
@@ -728,7 +800,10 @@ def build_user_html(
         past_nav = hist[past_dates[-1]].get("nav_return")
         if past_nav is None:
             return None
-        return round((1 + cur_nav / 100) / (1 + past_nav / 100) * 100 - 100, 2)
+        denom = 1 + past_nav / 100
+        if denom == 0:
+            return None
+        return round((1 + cur_nav / 100) / denom * 100 - 100, 2)
 
     _period_labels = [("1개월", 30), ("3개월", 90), ("6개월", 180), ("1년", 365), ("전체", None)]
     def _period_ret_all():
@@ -744,7 +819,10 @@ def build_user_html(
         cur_nav = hist[sorted_dates[-1]].get("nav_return")
         if cur_nav is None or first_nav is None:
             return None
-        return round((1 + cur_nav / 100) / (1 + first_nav / 100) * 100 - 100, 2)
+        denom = 1 + first_nav / 100
+        if denom == 0:
+            return None
+        return round((1 + cur_nav / 100) / denom * 100 - 100, 2)
 
     _period_vals = []
     for _lbl, _days in _period_labels:
@@ -1169,6 +1247,100 @@ window.toggleIndex = async function(name) {{
         '</div>'
     )
 
+    realized_total, realized_per_stock = compute_realized_pnl(uid, pname)
+    r_sign  = "+" if realized_total >= 0 else ""
+    r_color = "#16a34a" if realized_total >= 0 else "#dc2626"
+    r_disp  = fmt_krw(realized_total)
+
+    realized_card = f'''
+<div class="ov-metric">
+  <div class="m-label">
+    <span class="help-wrap">실현 손익
+      <span class="help-icon">?</span>
+      <span class="help-tip">매도 거래 기준 실현 손익.<br>매도단가 입력 시에만 집계됩니다.</span>
+    </span>
+  </div>
+  <div class="m-value" style="color:{r_color}">{r_sign}{r_disp}</div>
+  <div class="m-sub">청산 종목 기준</div>
+</div>'''
+
+    trade_rows = ""
+    total = len(trades)
+    for i, t in enumerate(reversed(trades[-50:])):
+        original_index = total - 1 - i
+        _ttype = t.get("type", "")
+        if _ttype == "신규매수":
+            t_label, t_color, t_bg, t_border = "신규매수", "#0ea5e9", "#eff6ff", "#bfdbfe"
+        elif _ttype == "추가매수" or _ttype == "buy":
+            t_label, t_color, t_bg, t_border = "추가매수", "#16a34a", "#f0fdf4", "#bbf7d0"
+        elif _ttype == "일부매도":
+            t_label, t_color, t_bg, t_border = "일부매도", "#f97316", "#fff7ed", "#fed7aa"
+        elif _ttype == "전량매도" or _ttype == "sell":
+            t_label, t_color, t_bg, t_border = "전량매도", "#dc2626", "#fef2f2", "#fecaca"
+        else:
+            t_label, t_color, t_bg, t_border = _ttype, "#64748b", "#f8fafc", "#e2e8f0"
+        avg_str  = fmt_krw(t.get("avg", 0))
+        amt_str  = fmt_krw(t["amount"])
+        qty_str  = (f'{t["qty"]:,.0f}주' if t["qty"] == int(t["qty"])
+                    else f'{t["qty"]:,.4f}주')
+        _rpnl = t.get("realized_pnl")
+        _rpnl_html = ""
+        if _rpnl is not None:
+            _rc = "#16a34a" if _rpnl >= 0 else "#dc2626"
+            _rs = "+" if _rpnl >= 0 else ""
+            _rpnl_html = (
+                f'<div style="font-size:.73rem;color:{_rc};font-weight:600;margin-top:2px">'
+                f'실현손익 {_rs}{fmt_krw(_rpnl)}</div>'
+            )
+        elif t.get("type") in ("일부매도", "전량매도", "sell"):
+            _rpnl_html = (
+                '<div style="font-size:.73rem;color:var(--muted);margin-top:2px">'
+                '실현손익 미집계 (매도단가 미입력)</div>'
+            )
+        trade_rows += f'''
+    <div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);
+                display:flex;align-items:flex-start;gap:8px">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+          <span style="font-size:.78rem;font-weight:700;color:{t_color};
+                background:{t_bg};border:1px solid {t_border};
+                border-radius:4px;padding:1px 6px">{t_label}</span>
+          <span style="font-size:.72rem;color:var(--muted)">{t["date"]} {t["time"]}</span>
+        </div>
+        <div style="font-size:.85rem;font-weight:700;color:var(--text)">{escape(t["name"])}</div>
+        <div style="font-size:.75rem;color:var(--secondary);margin-top:2px">
+          {qty_str} · {amt_str}
+        </div>
+        <div style="font-size:.73rem;color:var(--muted);margin-top:1px">
+          평균단가 {avg_str}
+        </div>
+        {_rpnl_html}
+      </div>
+      <button
+        onclick="deleteTrade({original_index})"
+        title="삭제"
+        style="flex-shrink:0;background:none;border:1px solid #fecaca;
+               border-radius:5px;padding:3px 6px;cursor:pointer;
+               font-size:.7rem;color:#dc2626;line-height:1;margin-top:2px">
+        🗑️
+      </button>
+    </div>'''
+    if not trade_rows:
+        trade_rows = '<div style="text-align:center;padding:32px 0;color:var(--muted);font-size:.82rem">거래 기록이 없습니다</div>'
+    trade_panel_html = f'''
+<div class="card" style="padding:0;overflow:hidden">
+  <div style="padding:14px 16px;border-bottom:1px solid var(--border);
+       display:flex;align-items:center;justify-content:space-between">
+    <div class="card-title" style="margin-bottom:0">거래 기록</div>
+    <button onclick="clearTrades()" title="전체 삭제"
+      style="background:none;border:1px solid var(--border);border-radius:6px;
+             padding:3px 8px;cursor:pointer;font-size:.72rem;color:var(--muted)">초기화</button>
+  </div>
+  <div style="max-height:calc(100vh - 200px);overflow-y:auto" id="trade-list">
+    {trade_rows}
+  </div>
+</div>'''
+
     return f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -1235,7 +1407,9 @@ body {{
 .tab:hover {{ color:var(--text); }}
 .tab.active {{ color:var(--text); font-weight:700; border-bottom-color:var(--accent); }}
 .nav-time {{ margin-left:auto; font-size:.72rem; color:var(--muted); flex-shrink:0; }}
-.main {{ max-width:1160px; margin:0 auto; padding:28px 20px 48px; }}
+.main {{ max-width:1480px; margin:0 auto; padding:28px 28px 48px; display:grid; grid-template-columns:1fr 300px; gap:20px; align-items:start; }}
+@media (max-width:1024px) {{ .main {{ grid-template-columns:1fr 280px; }} }}
+@media (max-width:768px)  {{ .main {{ grid-template-columns:1fr !important; }} }}
 .overview {{
   background:var(--surface);
   border-radius:14px;
@@ -1273,12 +1447,13 @@ body {{
 .table-card {{ background:var(--surface); border-radius:14px; box-shadow:var(--shadow); padding:22px; margin-bottom:16px; overflow-x:auto; }}
 .table-header {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }}
 .badge {{ background:#f1f5f9; color:var(--secondary); font-size:.7rem; font-weight:700; padding:3px 10px; border-radius:99px; }}
-table {{ width:100%; border-collapse:collapse; }}
+table {{ width:100%; border-collapse:collapse; min-width:620px; }}
 thead th {{ font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); font-weight:700; padding:8px 10px; border-bottom:1px solid var(--border); text-align:left; }}
 tbody tr {{ border-bottom:1px solid var(--border-subtle); transition:background .1s; }}
 tbody tr:last-child {{ border-bottom:none; }}
 tbody tr:hover {{ background:#f8fafc; }}
 tbody td {{ padding:12px 10px; }}
+tbody td:first-child {{ white-space:nowrap; }}
 .num {{ text-align:right; font-variant-numeric:tabular-nums; }}
 .footer {{ text-align:center; padding:28px 0 4px; font-size:.65rem; color:#cbd5e1; letter-spacing:.1em; text-transform:uppercase; }}
 @keyframes fadeIn {{ from {{ opacity:0; transform:translateY(10px); }} to {{ opacity:1; transform:translateY(0); }} }}
@@ -1341,6 +1516,7 @@ tbody td {{ padding:12px 10px; }}
 </nav>
 
 <div class="main">
+<div>
   <div class="overview">
     <div class="ov-main">
       <div class="ov-label">총 평가금액</div>
@@ -1378,6 +1554,7 @@ tbody td {{ padding:12px 10px; }}
         <div class="m-value" style="color:var(--text)">{net_inv_disp}</div>
         <div class="m-sub">총입금 - 총출금</div>
       </div>
+      {realized_card}
     </div>
   </div>
 
@@ -1435,6 +1612,10 @@ tbody td {{ padding:12px 10px; }}
 
   <div class="footer">Portfolio Dashboard &middot; {today_str} &middot; 투자 참고용</div>
 </div>
+<div style="position:sticky;top:68px">
+  {trade_panel_html}
+</div>
+</div>
 
 <!-- 종목 추가/수정 모달 -->
 <div class="modal-overlay" id="modal">
@@ -1454,16 +1635,19 @@ tbody td {{ padding:12px 10px; }}
     <div class="form-row" id="row-qty-avg">
       <div class="form-group" style="margin-bottom:0" id="row-qty">
         <label class="form-label">수량</label>
-        <input id="f-qty" class="form-input" type="number" placeholder="0" min="0">
+        <input id="f-qty" class="form-input" type="text" inputmode="numeric" placeholder="0"
+               oninput="_fmtInput(this,'int'); _onQtyChange();">
       </div>
       <div class="form-group" style="margin-bottom:0">
         <label class="form-label" id="label-avg">평균단가</label>
-        <input id="f-avg" class="form-input" type="number" placeholder="0" min="0" step="any">
+        <input id="f-avg" class="form-input" type="text" inputmode="decimal" placeholder="0"
+               oninput="_fmtInput(this,'dec')">
       </div>
     </div>
     <div class="form-group" id="row-cash" style="display:none">
       <label class="form-label">금액</label>
-      <input id="f-cash" class="form-input" type="number" placeholder="0" min="0" step="any">
+      <input id="f-cash" class="form-input" type="text" inputmode="decimal" placeholder="0"
+             oninput="_fmtInput(this,'dec')">
     </div>
     <div class="modal-actions">
       <button class="btn-cancel" onclick="closeModal()">취소</button>
@@ -1536,6 +1720,9 @@ const PNAME = "{pname_js}";
 const UID   = {uid};
 const TOKEN = "{token}";
 let _editMode = false, _editName = '';
+let _editOrigQty = 0;
+let _editOrigAvg = 0;
+let _wasSell = false;
 let _renamePname = '';
 
 function onCountryChange() {{
@@ -1543,6 +1730,46 @@ function onCountryChange() {{
   document.getElementById('row-name').style.display    = isCash ? 'none' : '';
   document.getElementById('row-qty-avg').style.display = isCash ? 'none' : '';
   document.getElementById('row-cash').style.display    = isCash ? '' : 'none';
+}}
+
+function _fmtInput(el, mode) {{
+  const sel = el.selectionStart;
+  const before = el.value;
+  let raw = before.replace(/[^0-9.]/g, '');
+  if (mode === 'int') raw = raw.replace(/\./g, '');
+  const parts = raw.split('.');
+  let intPart = parts[0] || '';
+  const decPart = parts.length > 1 ? '.' + parts.slice(1).join('') : '';
+  intPart = intPart.replace(/\B(?=(\d{{3}})+(?!\d))/g, ',');
+  const formatted = intPart + decPart;
+  el.value = formatted;
+  const diff = formatted.length - before.length;
+  el.setSelectionRange(sel + diff, sel + diff);
+}}
+
+function _parseNum(id) {{
+  return parseFloat(document.getElementById(id).value.replace(/,/g, '')) || 0;
+}}
+
+function _onQtyChange() {{
+  if (!_editMode) return;
+  const newQty  = _parseNum('f-qty');
+  const isSell  = newQty < _editOrigQty;
+  const label   = document.getElementById('label-avg');
+  const avgEl   = document.getElementById('f-avg');
+  if (isSell) {{
+    label.textContent = '매도 단가';
+    avgEl.placeholder = '매도 단가 입력';
+    if (_parseNum('f-avg') === _editOrigAvg) {{
+      avgEl.value = '';
+    }}
+  }} else {{
+    label.textContent = '평균단가';
+    avgEl.placeholder = '0';
+    if (!avgEl.value) {{
+      avgEl.value = Number(_editOrigAvg).toLocaleString('ko-KR');
+    }}
+  }}
 }}
 
 function openAddModal() {{
@@ -1554,19 +1781,28 @@ function openAddModal() {{
   document.getElementById('f-qty').value = '';
   document.getElementById('f-avg').value = '';
   document.getElementById('f-cash').value = '';
+  document.getElementById('label-avg').textContent = '평균단가';
+  document.getElementById('f-avg').placeholder = '0';
+  _editOrigQty = 0;
+  _editOrigAvg = 0;
+  _wasSell = false;
   onCountryChange();
   document.getElementById('modal').classList.add('open');
 }}
 
 function openEditModal(d) {{
   _editMode = true; _editName = d.name;
+  _editOrigQty = d.qty;
+  _editOrigAvg = d.avg;
+  _wasSell = false;
   document.getElementById('modal-title').textContent = '종목 수정';
   document.getElementById('f-name').value = d.name;
   document.getElementById('f-name').disabled = true;
   document.getElementById('f-country').value = d.country;
-  document.getElementById('f-qty').value = d.qty;
-  document.getElementById('f-avg').value = d.avg;
-  document.getElementById('f-cash').value = d.country === '현금' ? d.avg : '';
+  document.getElementById('f-qty').value  = Number(d.qty).toLocaleString('ko-KR');
+  document.getElementById('f-avg').value  = Number(d.avg).toLocaleString('ko-KR');
+  document.getElementById('f-cash').value = d.country === '현금'
+    ? Number(d.avg).toLocaleString('ko-KR') : '';
   onCountryChange();
   document.getElementById('modal').classList.add('open');
 }}
@@ -1579,12 +1815,12 @@ async function saveStock() {{
   const isCash = document.getElementById('f-country').value === '현금';
   const payload = isCash ? {{
     종목명: '현금', 국가: '현금', 수량: 1,
-    평단가: parseFloat(document.getElementById('f-cash').value) || 0,
+    평단가: _parseNum('f-cash'),
   }} : {{
     종목명: document.getElementById('f-name').value.trim(),
     국가:   document.getElementById('f-country').value,
-    수량:   parseFloat(document.getElementById('f-qty').value) || 0,
-    평단가: parseFloat(document.getElementById('f-avg').value) || 0,
+    수량:   _parseNum('f-qty'),
+    평단가: _parseNum('f-avg'),
   }};
   if (!isCash && !payload.종목명) {{ alert('종목명을 입력하세요'); btn.disabled=false; btn.textContent='저장'; return; }}
   try {{
@@ -1625,10 +1861,6 @@ async function refreshPrices() {{
     if (navBtn) {{ navBtn.textContent = '🔄';            navBtn.disabled = false; }}
   }}
 }}
-
-document.getElementById('modal').addEventListener('click', function(e) {{
-  if (e.target === this) closeModal();
-}});
 
 function openNewPortfolioModal() {{
   document.getElementById('new-ptab-name').value = '';
@@ -1730,6 +1962,23 @@ async function saveCashflow() {{
     btn.disabled = false; btn.textContent = '저장';
   }}
 }}
+async function clearTrades() {{
+  if (!confirm("거래 기록을 전체 삭제할까요?")) return;
+  const res = await fetch(`/u/${{UID}}/api/trades/${{PNAME}}?t=${{TOKEN}}`, {{method:'DELETE'}});
+  if (res.ok) {{ location.reload(); }}
+  else {{ alert('오류가 발생했습니다'); }}
+}}
+
+async function deleteTrade(index) {{
+  if (!confirm("이 거래 기록을 삭제할까요?")) return;
+  const res = await fetch(
+    `/u/${{UID}}/api/trades/${{PNAME}}/${{index}}?t=${{TOKEN}}`,
+    {{method: 'DELETE'}}
+  );
+  if (res.ok) {{ location.reload(); }}
+  else {{ alert('삭제 중 오류가 발생했습니다'); }}
+}}
+
 document.getElementById('cf-modal').addEventListener('click', function(e) {{
   if (e.target === this) closeCashflowModal();
 }});
@@ -2333,6 +2582,7 @@ def portfolio_page(uid: int, pname: str):
         all_portfolios=state["portfolios"],
         uid=uid,
         token=token,
+        trades=load_trades(uid, pname),
     )
 
 
@@ -2436,14 +2686,49 @@ def api_add_stock(uid: int, pname: str):
             if "비중(%)" not in df.columns:
                 df["비중(%)"] = 0.0
             if name in df["종목명"].values:
-                df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
-                    [country, avg, qty, currency]
+                old_qty = float(df.loc[df["종목명"] == name, "수량"].values[0])
+                old_avg = float(df.loc[df["종목명"] == name, "평단가"].values[0])
+                if name != "현금":
+                    diff = qty - old_qty
+                    if diff > 0:
+                        # avg = 사용자가 입력한 추가 매수 단가
+                        # new_avg = 가중평균 (df에 저장할 올바른 평단가)
+                        new_avg = (old_qty * old_avg + diff * avg) / qty
+                        df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
+                            [country, round(new_avg, 2), qty, currency]
+                        # price=avg(추가매수단가), display_avg도 avg로 통일 (단가×수량=금액 일관성)
+                        save_trade(uid, pname, "추가매수", name, diff, round(avg, 2))
+                    elif diff < 0:
+                        if qty == 0:
+                            # 수량을 0으로 입력 → 전량 매도 처리 후 종목 삭제
+                            # avg = 사용자가 입력한 매도 단가
+                            df = df[df["종목명"] != name].reset_index(drop=True)
+                            save_trade(uid, pname, "전량매도", name, old_qty,
+                                       round(avg, 2), display_avg=round(old_avg, 2))
+                        else:
+                            # avg = 사용자가 입력한 매도 단가
+                            # df에는 old_avg 유지 (매도해도 매수 평단가 변동 없음)
+                            df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
+                                [country, old_avg, qty, currency]
+                            # price=avg(매도단가), display_avg=old_avg(매수평단가) → realized_pnl 자동 계산
+                            save_trade(uid, pname, "일부매도", name, abs(diff),
+                                       round(avg, 2), display_avg=round(old_avg, 2))
+                    else:
+                        # 수량 동일 (평단가·국가만 수정): 그대로 저장
+                        df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
+                            [country, avg, qty, currency]
+                else:
+                    # 현금: 기존처럼 그대로 저장
+                    df.loc[df["종목명"] == name, ["국가", "평단가", "수량", "통화"]] = \
+                        [country, avg, qty, currency]
             else:
                 new_row = pd.DataFrame([{
                     "종목명": name, "국가": country,
                     "비중(%)": 0.0, "평단가": avg, "수량": qty, "통화": currency,
                 }])
                 df = pd.concat([df, new_row], ignore_index=True)
+                if name != "현금" and qty > 0:
+                    save_trade(uid, pname, "신규매수", name, qty, avg)
             drop_cols = [c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in df.columns]
             state["portfolios"][pname]["df"] = df.drop(columns=drop_cols)
             save_portfolios(uid, state["portfolios"], state["active_pname"])
@@ -2463,6 +2748,12 @@ def api_del_stock(uid: int, pname: str, name: str):
         df = state["portfolios"][pname]["df"].copy()
         if name not in df["종목명"].values:
             return jsonify({"error": "종목 없음"}), 404
+        if name != "현금":
+            _row = df[df["종목명"] == name].iloc[0]
+            _del_qty = float(_row["수량"]) if pd.notna(_row.get("수량")) else 0.0
+            _del_avg = float(_row["평단가"])
+            if _del_qty > 0:
+                save_trade(uid, pname, "전량매도", name, _del_qty, _del_avg, display_avg=None)
         state["portfolios"][pname]["df"] = df[df["종목명"] != name].reset_index(drop=True)
         save_portfolios(uid, state["portfolios"], state["active_pname"])
     return jsonify({"ok": True})
@@ -2532,6 +2823,39 @@ def api_index_returns(uid: int):
 def api_get_cashflow(uid: int, pname: str):
     _check_token(uid)
     return jsonify(load_cashflow(uid, pname))
+
+
+@app_flask.route("/u/<int:uid>/api/trades/<pname>", methods=["GET"])
+def api_get_trades(uid: int, pname: str):
+    _check_token(uid)
+    return jsonify(load_trades(uid, pname))
+
+
+@app_flask.route("/u/<int:uid>/api/trades/<pname>", methods=["DELETE"])
+def api_clear_trades(uid: int, pname: str):
+    _check_token(uid)
+    fpath = _trades_path(uid, pname)
+    if os.path.exists(fpath):
+        os.remove(fpath)
+    return jsonify({"ok": True})
+
+
+@app_flask.route("/u/<int:uid>/api/trades/<pname>/<int:index>", methods=["DELETE"])
+def api_delete_trade(uid: int, pname: str, index: int):
+    _check_token(uid)
+    records = load_trades(uid, pname)
+    if index < 0 or index >= len(records):
+        return jsonify({"error": "인덱스 범위 초과"}), 400
+    records.pop(index)
+    fpath   = _trades_path(uid, pname)
+    dirpath = os.path.dirname(fpath)
+    os.makedirs(dirpath, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8",
+                                      dir=dirpath, delete=False, suffix=".tmp") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+        tmp_path = f.name
+    os.replace(tmp_path, fpath)
+    return jsonify({"ok": True})
 
 
 @app_flask.route("/u/<int:uid>/api/cashflow/<pname>", methods=["POST"])
@@ -2611,6 +2935,8 @@ def start_ngrok() -> str:
 def build_dashboard_for(uid: int, pname: str) -> pd.DataFrame:
     state  = _get_user_state(uid)
     with _users_lock:
+        if pname not in state["portfolios"]:
+            return pd.DataFrame()
         p      = state["portfolios"][pname]
         df_raw = p["df"].drop(
             columns=[c for c in ["현재가", "수익률(%)", "등락률(%)", "USD_KRW"] if c in p["df"].columns]
@@ -2631,7 +2957,8 @@ def _build_dashboard_bg(uid: int, pname: str) -> None:
     """백그라운드 스레드용 wrapper — 완료 후 _building에서 제거."""
     try:
         build_dashboard_for(uid, pname)
-    except Exception:
+    except Exception as e:
+        log.error(f"빌드 실패 uid={uid} pname={pname}: {e}", exc_info=True)
         with _build_lock:
             _building.discard((uid, pname))
             _hist_check.pop((uid, pname), None)
@@ -2661,6 +2988,9 @@ def _summary_text(uid: int, pname: str) -> str:
     with _users_lock:
         p  = state["portfolios"][pname]
         df = p["df"].copy() if p.get("df") is not None else pd.DataFrame()
+    for col in ["수익률(%)", "현재가", "등락률(%)", "USD_KRW"]:
+        if col not in df.columns:
+            df[col] = float("nan")
     ts    = p["last_update"].strftime("%m/%d %H:%M") if p.get("last_update") else "—"
     name  = p.get("name", "포트폴리오")
     token = get_user_token(uid)
@@ -2799,6 +3129,10 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     active_pname = state["active_pname"]
     if active_pname not in state["portfolios"]:
         await update.message.reply_text("⚠️ 포트폴리오가 없습니다.")
+        return
+    _df = state["portfolios"][active_pname].get("df")
+    if _df is None or len(_df) == 0:
+        await update.message.reply_text("⚠️ 종목을 먼저 추가해 주세요.")
         return
     msg = await update.message.reply_text("🔄 가격 재조회 중...")
     try:
