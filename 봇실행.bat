@@ -12,7 +12,7 @@ if %errorlevel% neq 0 (
 )
 
 echo [2/3] 로컬 봇 시작...
-python -m portfolio_bot.main
+python run_bot.py
 
 echo [3/3] 서버 봇 재시작 중...
 ssh %SERVER% "sudo systemctl start %SERVICE%"

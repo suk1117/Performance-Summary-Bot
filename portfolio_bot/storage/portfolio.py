@@ -12,6 +12,7 @@ from portfolio_bot.state import (
     _get_portfolios_file_lock,
     _cashflow_locks, _cashflow_locks_lock,
     _history_locks, _history_locks_lock,
+    _trades_locks, _trades_locks_lock,
 )
 
 _NUMERIC_COLS = ["비중(%)", "평단가", "수량", "현재가", "수익률(%)", "등락률(%)", "USD_KRW"]
@@ -35,17 +36,21 @@ def _user_dir(uid: int) -> str:
 def _portfolios_file(uid: int) -> str:
     return os.path.join(_user_dir(uid), "portfolios.json")
 
-def _raw(uid: int) -> dict:
+def _raw_unsafe(uid: int) -> dict:
+    """락 없이 파일만 읽음 — 이미 락을 잡은 상태에서 호출하는 내부 헬퍼용."""
     fpath = _portfolios_file(uid)
-    lock  = _get_portfolios_file_lock(uid)
+    if not os.path.exists(fpath):
+        return {"active": "", "next_id": 1, "items": {}}
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"active": "", "next_id": 1, "items": {}}
+
+def _raw(uid: int) -> dict:
+    lock = _get_portfolios_file_lock(uid)
     with lock:
-        if not os.path.exists(fpath):
-            return {"active": "", "next_id": 1, "items": {}}
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {"active": "", "next_id": 1, "items": {}}
+        return _raw_unsafe(uid)
 
 def _save_raw(uid: int, data: dict):
     fpath = _portfolios_file(uid)
@@ -73,11 +78,7 @@ def get_user_token(uid: int) -> str:
     fpath = _portfolios_file(uid)
     lock  = _get_portfolios_file_lock(uid)
     with lock:
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception:
-            raw = {"active": "", "next_id": 1, "items": {}}
+        raw   = _raw_unsafe(uid)
         token = raw.get("token", "")
         if not token:
             token = _secrets.token_urlsafe(16)
@@ -173,11 +174,7 @@ def save_portfolios(uid: int, portfolios: dict, active_pname: str):
     lock    = _get_portfolios_file_lock(uid)
     with lock:
         # 최신 디스크 상태 읽기 (next_id, token 등 보존)
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception:
-            raw = {"active": "", "next_id": 1, "items": {}}
+        raw = _raw_unsafe(uid)
         raw["active"] = active_pname
         out = {}
         for pname, p in portfolios.items():
@@ -206,11 +203,7 @@ def create_portfolio(uid: int, name: str) -> str:
     fpath = _portfolios_file(uid)
     lock  = _get_portfolios_file_lock(uid)
     with lock:
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception:
-            raw = {"active": "", "next_id": 1, "items": {}}
+        raw = _raw_unsafe(uid)
         next_id = raw.get("next_id", 1)
         pname   = f"p{next_id}"
         raw["next_id"] = next_id + 1
@@ -243,3 +236,6 @@ def delete_portfolio(uid: int, pname: str):
     # history 락 정리
     with _history_locks_lock:
         _history_locks.pop(key, None)
+    # trades 락 정리
+    with _trades_locks_lock:
+        _trades_locks.pop(key, None)

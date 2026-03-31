@@ -1,0 +1,72 @@
+<HTA:APPLICATION
+  APPLICATIONNAME="봇 관리"
+  BORDER="dialog"
+  BORDERSTYLE="normal"
+  CAPTION="yes"
+  MAXIMIZEBUTTON="no"
+  MINIMIZEBUTTON="yes"
+  SCROLL="no"
+  SINGLEINSTANCE="yes"
+  WINDOWSTATE="normal"
+/>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>봇 관리</title>
+<style>
+  body {
+    font-family: '맑은 고딕', sans-serif;
+    background: #1e1e2e;
+    color: #cdd6f4;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    margin: 0;
+  }
+  h2 { margin-bottom: 30px; font-size: 20px; }
+  .btn {
+    width: 200px;
+    height: 55px;
+    font-size: 16px;
+    font-family: '맑은 고딕', sans-serif;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    margin: 10px;
+    font-weight: bold;
+  }
+  #btnStart { background: #a6e3a1; color: #1e1e2e; }
+  #btnStop  { background: #f38ba8; color: #1e1e2e; }
+  #status {
+    margin-top: 20px;
+    font-size: 14px;
+    color: #a6adc8;
+  }
+</style>
+</head>
+<body>
+<h2>📊 포트폴리오 봇 관리</h2>
+<button class="btn" id="btnStart" onclick="startBot()">▶ 봇 시작</button>
+<button class="btn" id="btnStop"  onclick="stopBot()">■ 봇 종료</button>
+<div id="status">대기 중...</div>
+
+<script language="VBScript">
+Dim oShell
+Set oShell = CreateObject("WScript.Shell")
+
+Sub startBot()
+  Dim botDir
+  botDir = oShell.ExpandEnvironmentStrings("%OneDrive%\파이썬.py\수익률 정리.py")
+  oShell.Run "cmd /c cd /d """ & botDir & """ && python run_bot.py", 1, False
+  document.getElementById("status").innerText = "✅ 봇 시작됨"
+End Sub
+
+Sub stopBot()
+  oShell.Run "taskkill /f /im python.exe", 0, True
+  document.getElementById("status").innerText = "🛑 봇 종료됨"
+End Sub
+</script>
+</body>
+</html>

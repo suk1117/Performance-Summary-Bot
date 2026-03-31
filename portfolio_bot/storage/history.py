@@ -14,13 +14,13 @@ def _history_path(uid: int, pname: str) -> str:
     return os.path.join(_user_dir(uid), f"history_{_safe_pname(pname)}.json")
 
 
-def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
+def save_snapshot(uid: int, pname: str, df: pd.DataFrame, usd_krw: float, force: bool = False):
     lock = _get_history_lock(uid, pname)
     with lock:
-        _save_snapshot_inner(uid, pname, df, usd_krw)
+        _save_snapshot_inner(uid, pname, df, usd_krw, force)
 
 
-def _save_snapshot_inner(uid: int, pname: str, df: pd.DataFrame, usd_krw: float):
+def _save_snapshot_inner(uid: int, pname: str, df: pd.DataFrame, usd_krw: float, force: bool = False):
     # 지연 import — history ↔ cashflow circular import 방지
     from portfolio_bot.storage.cashflow import get_net_investment, compute_nav_units
 
@@ -33,7 +33,10 @@ def _save_snapshot_inner(uid: int, pname: str, df: pd.DataFrame, usd_krw: float)
         except Exception:
             history = {}
 
-    today          = date.today().isoformat()
+    today = date.today().isoformat()
+    if today in history and not force:
+        return  # 당일 이미 저장됨, skip
+
     stock_eval_krw = 0.0
     total_buy      = 0.0
     positions      = {}

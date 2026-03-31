@@ -13,7 +13,7 @@ from portfolio_bot.config import DATA_DIR, FLASK_PORT, FLASK_PUBLIC_URL, KST, NG
     TELEGRAM_CHAT_ID, USE_NGROK
 from portfolio_bot.state import (
     _build_lock, _building, _hist_check,
-    _users_lock, all_users, public_url as _pub_url,
+    _users_lock, all_users,
 )
 from portfolio_bot.storage import (
     add_cashflow, create_portfolio, delete_portfolio, get_user_token,
@@ -448,7 +448,7 @@ def build_dashboard_for(uid: int, pname: str) -> pd.DataFrame:
         ).copy()
     df = fetch_prices(df_raw)   # 락 밖에서 네트워크 IO
     usd_krw = float(df["USD_KRW"].iloc[0]) if "USD_KRW" in df.columns and len(df) > 0 else 1370.0
-    save_snapshot(uid, pname, df, usd_krw)
+    save_snapshot(uid, pname, df, usd_krw, force=True)
     with _users_lock:
         if pname not in state["portfolios"]:
             return df

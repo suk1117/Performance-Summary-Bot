@@ -35,6 +35,17 @@ def _get_history_lock(uid: int, pname: str) -> threading.Lock:
             _history_locks[key] = threading.Lock()
         return _history_locks[key]
 
+# ── trades 파일별 락 ──
+_trades_locks: dict = {}
+_trades_locks_lock = threading.Lock()
+
+def _get_trades_lock(uid: int, pname: str) -> threading.Lock:
+    key = (uid, pname)
+    with _trades_locks_lock:
+        if key not in _trades_locks:
+            _trades_locks[key] = threading.Lock()
+        return _trades_locks[key]
+
 # ── portfolios.json uid별 파일 락 ──
 _portfolios_file_locks: dict = {}
 _portfolios_file_locks_lock = threading.Lock()
